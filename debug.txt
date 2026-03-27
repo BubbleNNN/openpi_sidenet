@@ -1,10 +1,14 @@
-GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
-warning: The `tool.uv.dev-dependencies` field (used in `packages/openpi-client/pyproject.toml`) is deprecated and will be removed in a future re
-lease; use `dependency-groups.dev` instead                                                                                                      Using Python 3.14.3 environment at: /home/mxuan.zhao/miniconda3/envs/openpi_sidenet
-  × No solution found when resolving dependencies:
-  ╰─▶ Because torch==2.7.1 has no wheels with a matching Python ABI tag (e.g., `cp314`) and openpi==0.1.0 depends on torch==2.7.1, we can
-      conclude that openpi==0.1.0 cannot be used.
-      And because only openpi==0.1.0 is available and you require openpi, we can conclude that your requirements are unsatisfiable.
-
-      hint: You require CPython 3.14 (`cp314`), but we only found wheels for `torch` (v2.7.1) with the following Python ABI tags: `cp39`,
-      `cp310`, `cp311`, `cp312`, `cp313`, `cp313t`
+(openpi311) mxuan.zhao@ubuntu94:~/openpi_sidenet$ uv run scripts/compute_norm_stats.py --config-name pi05_with_sidenet
+warning: The `tool.uv.dev-dependencies` field (used in `packages/openpi-client/pyproject.toml`) is deprecated and will be removed in a future release; use `dependency-groups.dev` instead
+Traceback (most recent call last):
+  File "/home/mxuan.zhao/openpi_sidenet/scripts/compute_norm_stats.py", line 15, in <module>
+    import openpi.training.data_loader as _data_loader
+  File "/home/mxuan.zhao/openpi_sidenet/src/openpi/training/data_loader.py", line 10, in <module>
+    import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+  File "/home/mxuan.zhao/openpi_sidenet/.venv/lib/python3.11/site-packages/lerobot/common/datasets/lerobot_dataset.py", line 68, in <module>
+    from lerobot.common.datasets.video_utils import (
+  File "/home/mxuan.zhao/openpi_sidenet/.venv/lib/python3.11/site-packages/lerobot/common/datasets/video_utils.py", line 24, in <module>
+    import av
+  File "/home/mxuan.zhao/openpi_sidenet/.venv/lib/python3.11/site-packages/av/__init__.py", line 3, in <module>
+    from av._core import time_base, library_versions, ffmpeg_version_info
+ImportError: libavformat.so.61: cannot open shared object file: No such file or directory
