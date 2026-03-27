@@ -1,8 +1,10 @@
-GIT_LFS_SKIP_SMUDGE=1 uv sync
+GIT_LFS_SKIP_SMUDGE=1 uv sync --no-build-isolation-package av
 warning: The `tool.uv.dev-dependencies` field (used in `packages/openpi-client/pyproject.toml`) is deprecated and will be removed in a future re
 lease; use `dependency-groups.dev` instead                                                                                                      warning: Found both a `uv.toml` file and a `[tool.uv]` section in an adjacent `pyproject.toml`. The following fields from `[tool.uv]` will be ig
-nored in favor of the `uv.toml` file:                                                                                                           - override-dependencies                                                                                                                         
-Resolved 281 packages in 9ms                                                                                                                    
+nored in favor of the `uv.toml` file:                                                                                                           - override-dependencies
+Resolved 281 packages in 19ms
+Prepared 28 packages in 16m 28s
+Installed 241 packages in 370ms
   × Failed to build `av==14.4.0`
   ├─▶ The build backend returned an error
   ╰─▶ Call to `setuptools.build_meta:__legacy__.build_wheel` failed (exit status: 1)
@@ -13,37 +15,30 @@ Resolved 281 packages in 9ms
       It is EXPECTED that it will fail. You are REQUIRED to use ffmpeg 7.
       You MUST have Cython, pkg-config, and a C compiler.
 
-      pkg-config could not find libraries ['avformat', 'avcodec', 'avdevice', 'avutil', 'avfilter', 'swscale', 'swresample']
 
       [stderr]
-      Package libavformat was not found in the pkg-config search path.
-      Perhaps you should add the directory containing `libavformat.pc'
-      to the PKG_CONFIG_PATH environment variable
-      No package 'libavformat' found
-      Package libavcodec was not found in the pkg-config search path.
-      Perhaps you should add the directory containing `libavcodec.pc'
-      to the PKG_CONFIG_PATH environment variable
-      No package 'libavcodec' found
-      Package libavdevice was not found in the pkg-config search path.
-      Perhaps you should add the directory containing `libavdevice.pc'
-      to the PKG_CONFIG_PATH environment variable
-      No package 'libavdevice' found
-      Package libavutil was not found in the pkg-config search path.
-      Perhaps you should add the directory containing `libavutil.pc'
-      to the PKG_CONFIG_PATH environment variable
-      No package 'libavutil' found
-      Package libavfilter was not found in the pkg-config search path.
-      Perhaps you should add the directory containing `libavfilter.pc'                                                                          
-      to the PKG_CONFIG_PATH environment variable                                                                                               
-      No package 'libavfilter' found                                                                                                            
-      Package libswscale was not found in the pkg-config search path.                                                                           
-      Perhaps you should add the directory containing `libswscale.pc'                                                                           
-      to the PKG_CONFIG_PATH environment variable                                                                                               
-      No package 'libswscale' found
-      Package libswresample was not found in the pkg-config search path.
-      Perhaps you should add the directory containing `libswresample.pc'
-      to the PKG_CONFIG_PATH environment variable
-      No package 'libswresample' found
+      Traceback (most recent call last):
+        File "<string>", line 11, in <module>
+        File "/home/mxuan.zhao/openpi_sidenet/.venv/lib/python3.11/site-packages/setuptools/build_meta.py", line 432, in build_wheel
+          return _build(['bdist_wheel'])
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+        File "/home/mxuan.zhao/openpi_sidenet/.venv/lib/python3.11/site-packages/setuptools/build_meta.py", line 423, in _build
+          return self._build_with_temp_dir(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^
+        File "/home/mxuan.zhao/openpi_sidenet/.venv/lib/python3.11/site-packages/setuptools/build_meta.py", line 404, in _build_with_temp_dir
+          self.run_setup()
+        File "/home/mxuan.zhao/openpi_sidenet/.venv/lib/python3.11/site-packages/setuptools/build_meta.py", line 512, in run_setup
+          super().run_setup(setup_script=setup_script)
+        File "/home/mxuan.zhao/openpi_sidenet/.venv/lib/python3.11/site-packages/setuptools/build_meta.py", line 317, in run_setup
+          exec(code, locals())
+        File "<string>", line 35, in <module>
+      ModuleNotFoundError: No module named 'Cython'
 
-      hint: This usually indicates a problem with the package or the build environment.
+      hint: This error likely indicates that `av@14.4.0` depends on `Cython`, but doesn't declare it as a build dependency. If `av` is a
+      first-party package, consider adding `Cython` to its `build-system.requires`. Otherwise, either add it to your `pyproject.toml` under:
+
+      [tool.uv.extra-build-dependencies]
+      av = ["Cython"]
+
+      or `uv pip install Cython` into the environment and re-run with `--no-build-isolation`.
   help: `av` (v14.4.0) was included because `openpi` (v0.1.0) depends on `lerobot` (v0.1.0) which depends on `av`
