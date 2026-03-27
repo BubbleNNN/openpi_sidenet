@@ -1,0 +1,49 @@
+GIT_LFS_SKIP_SMUDGE=1 uv sync
+warning: The `tool.uv.dev-dependencies` field (used in `packages/openpi-client/pyproject.toml`) is deprecated and will be removed in a future re
+lease; use `dependency-groups.dev` instead                                                                                                      warning: Found both a `uv.toml` file and a `[tool.uv]` section in an adjacent `pyproject.toml`. The following fields from `[tool.uv]` will be ig
+nored in favor of the `uv.toml` file:                                                                                                           - override-dependencies                                                                                                                         
+Resolved 281 packages in 9ms                                                                                                                    
+  × Failed to build `av==14.4.0`
+  ├─▶ The build backend returned an error
+  ╰─▶ Call to `setuptools.build_meta:__legacy__.build_wheel` failed (exit status: 1)
+
+      [stdout]
+
+      Warning! You are installing from source.
+      It is EXPECTED that it will fail. You are REQUIRED to use ffmpeg 7.
+      You MUST have Cython, pkg-config, and a C compiler.
+
+      pkg-config could not find libraries ['avformat', 'avcodec', 'avdevice', 'avutil', 'avfilter', 'swscale', 'swresample']
+
+      [stderr]
+      Package libavformat was not found in the pkg-config search path.
+      Perhaps you should add the directory containing `libavformat.pc'
+      to the PKG_CONFIG_PATH environment variable
+      No package 'libavformat' found
+      Package libavcodec was not found in the pkg-config search path.
+      Perhaps you should add the directory containing `libavcodec.pc'
+      to the PKG_CONFIG_PATH environment variable
+      No package 'libavcodec' found
+      Package libavdevice was not found in the pkg-config search path.
+      Perhaps you should add the directory containing `libavdevice.pc'
+      to the PKG_CONFIG_PATH environment variable
+      No package 'libavdevice' found
+      Package libavutil was not found in the pkg-config search path.
+      Perhaps you should add the directory containing `libavutil.pc'
+      to the PKG_CONFIG_PATH environment variable
+      No package 'libavutil' found
+      Package libavfilter was not found in the pkg-config search path.
+      Perhaps you should add the directory containing `libavfilter.pc'                                                                          
+      to the PKG_CONFIG_PATH environment variable                                                                                               
+      No package 'libavfilter' found                                                                                                            
+      Package libswscale was not found in the pkg-config search path.                                                                           
+      Perhaps you should add the directory containing `libswscale.pc'                                                                           
+      to the PKG_CONFIG_PATH environment variable                                                                                               
+      No package 'libswscale' found
+      Package libswresample was not found in the pkg-config search path.
+      Perhaps you should add the directory containing `libswresample.pc'
+      to the PKG_CONFIG_PATH environment variable
+      No package 'libswresample' found
+
+      hint: This usually indicates a problem with the package or the build environment.
+  help: `av` (v14.4.0) was included because `openpi` (v0.1.0) depends on `lerobot` (v0.1.0) which depends on `av`
