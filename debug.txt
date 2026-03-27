@@ -1,38 +1,523 @@
-(openpi311) mxuan.zhao@ubuntu94:~/openpi_sidenet$ uv run scripts/compute_norm_stats.py --config-name pi05_with_sidenet
-warning: The `tool.uv.dev-dependencies` field (used in `packages/openpi-client/pyproject.toml`) is deprecated and will be removed in a future release; use `dependency-groups.dev` instead
-^CTraceback (most recent call last):
-  File "/home/mxuan.zhao/openpi_sidenet/scripts/compute_norm_stats.py", line 117, in <module>
-    tyro.cli(main)
-  File "/home/mxuan.zhao/openpi_sidenet/.venv/lib/python3.11/site-packages/tyro/_cli.py", line 229, in cli
-    return run_with_args_from_cli()
-           ^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/mxuan.zhao/openpi_sidenet/scripts/compute_norm_stats.py", line 91, in main
+TrainConfig(
+        name="pi05_with_sidenet",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,  # pi05 is trained with 32-dim actions
+            action_horizon=16,
+        ),
+        data=SamsungDataConfig(
+            repo_id="/robot_share/dataset/lerobot/water_hose_insertion/lerobot_260324_to_260325_water_hose_assembly_v3_rby1_410s",
+            default_prompt="Insert the right water hose into the hole",
+            ft_window_size=6
+        ),
+        #weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        pytorch_weight_path="/robot_share/model/SR_pi05_base/Pi_05_Pretrain_Weights_200000",
+        sidenet=SideNetTrainConfig(
+            enabled=True,
+            config_path="./sidenet/sidenet_config.yaml",
+            train_pi05=False,
+            # FIX: modalities are now keyed by Observation.modalities / SideNet
+            # branch names instead of raw dataset keys.
+            modalities=("force_torque",),
+            use_backbone_injector=True,
+            use_expert_injector=True,
+            checkpoint=SideNetCheckpointConfig(
+                save_base_pi05=False,
+                save_sidenet_full=True,
+                save_sidenet_branches=True,
+            ),
+        ),
+        num_train_steps=20_000,
+    ),
+tokenizer.py
+import logging
+import os
+
+import jax
+import numpy as np
+import orbax.checkpoint as ocp
+import sentencepiece
+from transformers import AutoProcessor
+
+import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
+import openpi.shared.download as download
+
+
+class PaligemmaTokenizer:
+    def __init__(self, max_len: int = 48):
+        self._max_len = max_len
+        #FIX: add local path
+        path = download.maybe_download("/robot_share/model/pretrain_model/tokenizers/big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        with path.open("rb") as f:
+            self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
+
+    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
+        if state is not None:
+            # This is the Pi05 format, where the state is part of the discrete language input.
+            discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+            state_str = " ".join(map(str, discretized_state))
+            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+            tokens = self._tokenizer.encode(full_prompt, add_bos=True)
+        else:
+            # This is the Pi0 format, where the state is part of the continuous action expert input.
+            # tokenize "\n" separately as the "start of answer" token
+            tokens = self._tokenizer.encode(cleaned_text, add_bos=True) + self._tokenizer.encode("\n")
+        tokens_len = len(tokens)
+        if tokens_len < self._max_len:
+            padding = [False] * (self._max_len - tokens_len)
+            mask = [True] * tokens_len + padding
+            tokens = tokens + padding
+        else:
+            if len(tokens) > self._max_len:
+                logging.warning(
+                    f"Token length ({len(tokens)}) exceeds max length ({self._max_len}), truncating. "
+                    "Consider increasing the `max_token_len` in your model config if this happens frequently."
+                )
+            tokens = tokens[: self._max_len]
+            mask = [True] * self._max_len
+
+        return np.asarray(tokens), np.asarray(mask)
+
+
+class FASTTokenizer:
+    def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
+        self._max_len = max_len
+
+        # Download base PaliGemma tokenizer
+        path = download.maybe_download("/robot_share/model/pretrain_model/tokenizers/big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        with path.open("rb") as f:
+            self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
+
+        # Instantiate FAST tokenizer
+        self._fast_tokenizer = AutoProcessor.from_pretrained(fast_tokenizer_path, trust_remote_code=True)
+        self._fast_skip_tokens = 128  # Skip last 128 tokens in PaliGemma vocab since they are special tokens
+
+    def tokenize(
+        self, prompt: str, state: np.ndarray, actions: np.ndarray | None
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        cleaned_text = prompt.lower().strip().replace("_", " ")
+
+        # Convention: state gets discretized into 256 discrete bins (assumed range after normalization: [-1, 1])
+        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+
+        # Convention: prefix includes prompt and string-representation of state, followed by ';'
+        state_str = " ".join(map(str, discretized_state))
+        prefix = f"Task: {cleaned_text}, State: {state_str};\n"
+        prefix_tokens = self._paligemma_tokenizer.encode(prefix, add_bos=True)
+
+        if actions is not None:
+            # Tokenize actions with FAST tokenizer --> map to last tokens in PaliGemma vocab
+            action_tokens = self._fast_tokenizer(actions[None])[0]
+            action_tokens_in_pg = self._act_tokens_to_paligemma_tokens(action_tokens)
+
+            # Convention: postfix contains 'Action:' followed by FAST tokens, followed by '|'
+            postfix_tokens = (
+                self._paligemma_tokenizer.encode("Action: ")
+                + action_tokens_in_pg.tolist()
+                + self._paligemma_tokenizer.encode("|", add_eos=True)
+            )
+        else:
+            postfix_tokens = []
+
+        # Create output token sequence & masks
+        # AR mask is 0 on prefix (bidirectional attention) and 1 on postfix (causal attention to all previous tokens)
+        tokens = prefix_tokens + postfix_tokens
+        token_mask = [True] * len(tokens)
+        ar_mask = [0] * len(prefix_tokens) + [1] * len(postfix_tokens)
+        loss_mask = [False] * len(prefix_tokens) + [True] * len(postfix_tokens)  # Loss on postfix only
+
+        # Pad tokens to max length
+        tokens_len = len(tokens)
+        if tokens_len < self._max_len:
+            padding = [False] * (self._max_len - tokens_len)
+            tokens = tokens + padding
+            token_mask = token_mask + padding
+            ar_mask = ar_mask + padding
+            loss_mask = loss_mask + padding
+        else:
+            if len(tokens) > self._max_len:
+                logging.warning(
+                    f"Token length ({len(tokens)}) exceeds max length ({self._max_len}), truncating. "
+                    "Consider increasing the `max_token_len` in your model config if this happens frequently."
+                )
+            tokens = tokens[: self._max_len]
+            token_mask = token_mask[: self._max_len]
+            ar_mask = ar_mask[: self._max_len]
+            loss_mask = loss_mask[: self._max_len]
+
+        return np.asarray(tokens), np.asarray(token_mask), np.asarray(ar_mask), np.asarray(loss_mask)
+
+    def extract_actions(self, tokens: np.ndarray, action_horizon: int, action_dim: int) -> np.ndarray:
+        # Decode predicted output tokens
+        decoded_tokens = self._paligemma_tokenizer.decode(tokens.tolist())
+
+        # Extract actions from FAST model outputs
+        if "Action: " not in decoded_tokens:
+            return np.zeros((action_horizon, action_dim), dtype=np.float32)
+
+        # Extract actions from decoded tokens
+        raw_action_tokens = np.array(
+            self._paligemma_tokenizer.encode(decoded_tokens.split("Action: ")[1].split("|")[0].strip())
+        )
+        action_tokens = self._act_tokens_to_paligemma_tokens(raw_action_tokens)
+        return self._fast_tokenizer.decode(
+            [action_tokens.tolist()], time_horizon=action_horizon, action_dim=action_dim
+        )[0]
+
+    def _act_tokens_to_paligemma_tokens(self, tokens: np.ndarray | list[int]) -> np.ndarray:
+        if isinstance(tokens, list):
+            tokens = np.array(tokens)
+        return self._paligemma_tokenizer.vocab_size() - 1 - self._fast_skip_tokens - tokens
+
+
+###########################################################################
+## The tokenizers below are used for RoboArena baseline implementations. ##
+## They are *not* used for pi0-style models.                             ##
+###########################################################################
+
+
+class BinningTokenizer:
+    """
+    Standard RT-2 / OpenVLA style binning tokenizer.
+    """
+
+    def __init__(self, max_len: int = 256, n_bins: int = 256):
+        self._max_len = max_len
+        self._n_bins = n_bins
+
+        # Download base PaliGemma tokenizer
+        path = download.maybe_download("/robot_share/model/pretrain_model/tokenizers/big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        with path.open("rb") as f:
+            self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
+
+        self._fast_skip_tokens = 128  # Skip last 128 tokens in PaliGemma vocab since they are special tokens
+
+    def tokenize(
+        self, prompt: str, state: np.ndarray, actions: np.ndarray | None
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Tokenize a prompt and state into a sequence of tokens.
+
+        Args:
+            prompt: The text prompt to tokenize.
+            state: The state array to discretize and tokenize.
+            actions: Must be None. Action encoding is not currently supported.
+
+        Returns:
+            A tuple of (tokens, token_mask, ar_mask, targets).
+
+        Raises:
+            NotImplementedError: If actions is not None.
+        """
+        cleaned_text = prompt.lower().strip().replace("_", " ")
+
+        # Convention: state gets discretized into 256 discrete bins (assumed range after normalization: [-1, 1])
+        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+
+        # Convention: prefix includes prompt and string-representation of state, followed by ';'
+        state_str = " ".join(map(str, discretized_state))
+        prefix = f"Task: {cleaned_text}, State: {state_str};\n"
+        prefix_tokens = self._paligemma_tokenizer.encode(prefix, add_bos=True)
+
+        if actions is not None:
+            raise NotImplementedError("BinningTokenizer does not support encoding actions atm (only for inference use)")
+        postfix_tokens = []
+
+        # Create output token sequence & masks
+        # AR mask is 0 on prefix (bidirectional attention) and 1 on postfix (causal attention to all previous tokens)
+        tokens = prefix_tokens + postfix_tokens
+        token_mask = [True] * len(tokens)
+        ar_mask = [0] * len(prefix_tokens) + [1] * len(postfix_tokens)
+        loss_mask = [False] * len(prefix_tokens) + [True] * len(postfix_tokens)  # Loss on postfix only
+
+        # Pad tokens to max length
+        tokens_len = len(tokens)
+        if tokens_len < self._max_len:
+            padding = [False] * (self._max_len - tokens_len)
+            tokens = tokens + padding
+            token_mask = token_mask + padding
+            ar_mask = ar_mask + padding
+            loss_mask = loss_mask + padding
+        else:
+            if len(tokens) > self._max_len:
+                logging.warning(
+                    f"Token length ({len(tokens)}) exceeds max length ({self._max_len}), truncating. "
+                    "Consider increasing the `max_token_len` in your model config if this happens frequently."
+                )
+            tokens = tokens[: self._max_len]
+            token_mask = token_mask[: self._max_len]
+            ar_mask = ar_mask[: self._max_len]
+            loss_mask = loss_mask[: self._max_len]
+
+        return np.asarray(tokens), np.asarray(token_mask), np.asarray(ar_mask), np.asarray(loss_mask)
+
+    def extract_actions(self, tokens: np.ndarray, action_horizon: int, action_dim: int) -> np.ndarray:
+        # Decode predicted output tokens
+        decoded_tokens = self._paligemma_tokenizer.decode(tokens.tolist())
+
+        # Extract actions from FAST model outputs
+        if "Action: " not in decoded_tokens:
+            return np.zeros((action_horizon, action_dim), dtype=np.float32)
+
+        # Extract actions from decoded tokens
+        raw_action_tokens = np.array(
+            self._paligemma_tokenizer.encode(decoded_tokens.split("Action: ")[1].split("|")[0].strip())
+        )
+        action_tokens = self._act_tokens_to_paligemma_tokens(raw_action_tokens)
+        if len(action_tokens) < action_horizon * action_dim:
+            return np.zeros([action_horizon, action_dim], dtype=np.float32)
+        action_tokens = action_tokens[: (action_horizon * action_dim)].reshape([action_horizon, action_dim])
+        return action_tokens / self._n_bins * 2 - 1
+
+    def _act_tokens_to_paligemma_tokens(self, tokens: np.ndarray | list[int]) -> np.ndarray:
+        if isinstance(tokens, list):
+            tokens = np.array(tokens)
+        return self._paligemma_tokenizer.vocab_size() - 1 - self._fast_skip_tokens - tokens
+
+
+class FSQTokenizer:
+    """
+    FSQ tokenizer from the FAST paper baselines.
+    """
+
+    def __init__(self, max_len: int = 256, fsq_tokenizer_path: str | None = None):
+        self._max_len = max_len
+
+        assert fsq_tokenizer_path is not None, "fsq_tokenizer_path must be provided"
+        # Download tokenizer
+        path = download.maybe_download(fsq_tokenizer_path)
+        tok_path = os.path.join(path, os.listdir(path)[0])
+
+        # Split step from path
+        step = int(tok_path.split("/")[-1])
+        base_path = tok_path.rsplit("/", 1)[0]
+
+        mgr = ocp.CheckpointManager(
+            base_path,
+            item_handlers={
+                "params": ocp.StandardCheckpointHandler(),
+                "opt_state": ocp.StandardCheckpointHandler(),
+                "config": ocp.JsonCheckpointHandler(),
+            },
+            options=ocp.CheckpointManagerOptions(max_to_keep=1),
+        )
+
+        try:
+            restored = mgr.restore(
+                step, args=ocp.args.Composite(config=ocp.args.JsonRestore(), params=ocp.args.StandardRestore())
+            )
+            config = restored["config"]
+            self._params = restored["params"]
+            self._fsq_tokenizer = fsq_tokenizer.FsqAttentionTokenizer(**config)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load FSQ tokenizer checkpoint from {fsq_tokenizer_path}. Error: {e!s}"
+            ) from e
+
+        # Compile tokenize and detokenize functions
+        self._tokenize_fn = jax.jit(
+            lambda params, x: self._fsq_tokenizer.apply({"params": params}, x, method=self._fsq_tokenizer.tokenize)
+        )
+        self._detokenize_fn = jax.jit(
+            lambda params, x: self._fsq_tokenizer.apply({"params": params}, x, method=self._fsq_tokenizer.detokenize)
+        )
+
+        # Download base PaliGemma tokenizer
+        path = download.maybe_download("/robot_share/model/pretrain_model/tokenizers/big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        with path.open("rb") as f:
+            self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
+
+        self._fast_skip_tokens = 128  # Skip last 128 tokens in PaliGemma vocab since they are special tokens
+
+    def tokenize(
+        self, prompt: str, state: np.ndarray, actions: np.ndarray | None
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        cleaned_text = prompt.lower().strip().replace("_", " ")
+
+        # Convention: state gets discretized into 256 discrete bins (assumed range after normalization: [-1, 1])
+        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+
+        # Convention: prefix includes prompt and string-representation of state, followed by ';'
+        state_str = " ".join(map(str, discretized_state))
+        prefix = f"Task: {cleaned_text}, State: {state_str};\n"
+        prefix_tokens = self._paligemma_tokenizer.encode(prefix, add_bos=True)
+
+        if actions is not None:
+            raise NotImplementedError("FSQTokenizer does not support encoding actions atm (only for inference use)")
+        postfix_tokens = []
+
+        # Create output token sequence & masks
+        # AR mask is 0 on prefix (bidirectional attention) and 1 on postfix (causal attention to all previous tokens)
+        tokens = prefix_tokens + postfix_tokens
+        token_mask = [True] * len(tokens)
+        ar_mask = [0] * len(prefix_tokens) + [1] * len(postfix_tokens)
+        loss_mask = [False] * len(prefix_tokens) + [True] * len(postfix_tokens)  # Loss on postfix only
+
+        # Pad tokens to max length
+        tokens_len = len(tokens)
+        if tokens_len < self._max_len:
+            padding = [False] * (self._max_len - tokens_len)
+            tokens = tokens + padding
+            token_mask = token_mask + padding
+            ar_mask = ar_mask + padding
+            loss_mask = loss_mask + padding
+        else:
+            if len(tokens) > self._max_len:
+                logging.warning(
+                    f"Token length ({len(tokens)}) exceeds max length ({self._max_len}), truncating. "
+                    "Consider increasing the `max_token_len` in your model config if this happens frequently."
+                )
+            tokens = tokens[: self._max_len]
+            token_mask = token_mask[: self._max_len]
+            ar_mask = ar_mask[: self._max_len]
+            loss_mask = loss_mask[: self._max_len]
+
+        return np.asarray(tokens), np.asarray(token_mask), np.asarray(ar_mask), np.asarray(loss_mask)
+
+    def extract_actions(self, tokens: np.ndarray, action_horizon: int, action_dim: int) -> np.ndarray:
+        # Decode predicted output tokens
+        decoded_tokens = self._paligemma_tokenizer.decode(tokens.tolist())
+
+        # Extract actions from FAST model outputs
+        if "Action: " not in decoded_tokens:
+            return np.zeros((action_horizon, action_dim), dtype=np.float32)
+
+        # Extract actions from decoded tokens
+        raw_action_tokens = np.array(
+            self._paligemma_tokenizer.encode(decoded_tokens.split("Action: ")[1].split("|")[0].strip())
+        )
+        action_tokens = self._act_tokens_to_paligemma_tokens(raw_action_tokens)
+        try:
+            # Move computation to CPU and compile on-demand
+            device = jax.devices("cpu")[0]
+            with jax.default_device(device):
+                detok_act = self._detokenize_fn(self._params, action_tokens[None, ...])[0]
+            return detok_act[: action_horizon * action_dim].reshape([action_horizon, action_dim])
+        except Exception as e:
+            logging.warning(f"Error decoding FSQ: {e}")
+            return np.zeros((action_horizon, action_dim))
+
+    def _act_tokens_to_paligemma_tokens(self, tokens: np.ndarray | list[int]) -> np.ndarray:
+        if isinstance(tokens, list):
+            tokens = np.array(tokens)
+        return self._paligemma_tokenizer.vocab_size() - 1 - self._fast_skip_tokens - tokens
+
+
+compute norm states.py
+"""Compute normalization statistics for a config.
+
+This script is used to compute the normalization statistics for a given config. It
+will compute the mean and standard deviation of the data in the dataset and save it
+to the config assets directory.
+"""
+
+import numpy as np
+import tqdm
+import tyro
+
+import openpi.models.model as _model
+import openpi.shared.normalize as normalize
+import openpi.training.config as _config
+import openpi.training.data_loader as _data_loader
+import openpi.transforms as transforms
+
+
+class RemoveStrings(transforms.DataTransformFn):
+    def __call__(self, x: dict) -> dict:
+        return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
+
+
+def create_torch_dataloader(
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    batch_size: int,
+    model_config: _model.BaseModelConfig,
+    num_workers: int,
+    max_frames: int | None = None,
+) -> tuple[_data_loader.Dataset, int]:
+    if data_config.repo_id is None:
+        raise ValueError("Data config must have a repo_id")
+    dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
+    dataset = _data_loader.TransformedDataset(
+        dataset,
+        [
+            *data_config.repack_transforms.inputs,
+            *data_config.data_transforms.inputs,
+            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
+            RemoveStrings(),
+        ],
+    )
+    if max_frames is not None and max_frames < len(dataset):
+        num_batches = max_frames // batch_size
+        shuffle = True
+    else:
+        num_batches = len(dataset) // batch_size
+        shuffle = False
+    data_loader = _data_loader.TorchDataLoader(
+        dataset,
+        local_batch_size=batch_size,
+        num_workers=num_workers,
+        shuffle=shuffle,
+        num_batches=num_batches,
+    )
+    return data_loader, num_batches
+
+
+def create_rlds_dataloader(
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    batch_size: int,
+    max_frames: int | None = None,
+) -> tuple[_data_loader.Dataset, int]:
+    dataset = _data_loader.create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=False)
+    dataset = _data_loader.IterableTransformedDataset(
+        dataset,
+        [
+            *data_config.repack_transforms.inputs,
+            *data_config.data_transforms.inputs,
+            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
+            RemoveStrings(),
+        ],
+        is_batched=True,
+    )
+    if max_frames is not None and max_frames < len(dataset):
+        num_batches = max_frames // batch_size
+    else:
+        # NOTE: this length is currently hard-coded for DROID.
+        num_batches = len(dataset) // batch_size
+    data_loader = _data_loader.RLDSDataLoader(
+        dataset,
+        num_batches=num_batches,
+    )
+    return data_loader, num_batches
+
+
+def main(config_name: str, max_frames: int | None = None):
+    config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
-                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/mxuan.zhao/openpi_sidenet/src/openpi/training/config.py", line 336, in create
-    model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
-                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/mxuan.zhao/openpi_sidenet/src/openpi/training/config.py", line 139, in __call__
-    _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/mxuan.zhao/openpi_sidenet/src/openpi/models/tokenizer.py", line 18, in __init__
-    path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/mxuan.zhao/openpi_sidenet/src/openpi/shared/download.py", line 93, in maybe_download
-    _download_fsspec(url, scratch_path, **kwargs)
-  File "/home/mxuan.zhao/openpi_sidenet/src/openpi/shared/download.py", line 126, in _download_fsspec
-    info = fs.info(url)
-           ^^^^^^^^^^^^
-  File "/home/mxuan.zhao/openpi_sidenet/.venv/lib/python3.11/site-packages/fsspec/asyn.py", line 118, in wrapper
-    return sync(self.loop, func, *args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/mxuan.zhao/openpi_sidenet/.venv/lib/python3.11/site-packages/fsspec/asyn.py", line 91, in sync
-    if event.wait(1):
-       ^^^^^^^^^^^^^
-  File "/home/mxuan.zhao/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu/lib/python3.11/threading.py", line 629, in wait
-    signaled = self._cond.wait(timeout)
-               ^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/mxuan.zhao/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu/lib/python3.11/threading.py", line 331, in wait
-    gotit = waiter.acquire(True, timeout)
-            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-KeyboardInterrupt
+
+    if data_config.rlds_data_dir is not None:
+        data_loader, num_batches = create_rlds_dataloader(
+            data_config, config.model.action_horizon, config.batch_size, max_frames
+        )
+    else:
+        data_loader, num_batches = create_torch_dataloader(
+            data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
+        )
+
+    keys = ["state", "actions"]
+    stats = {key: normalize.RunningStats() for key in keys}
+
+    for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
+        for key in keys:
+            stats[key].update(np.asarray(batch[key]))
+
+    norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
+
+    output_path = config.assets_dirs / data_config.repo_id
+    print(f"Writing stats to: {output_path}")
+    normalize.save(output_path, norm_stats)
+
+
+if __name__ == "__main__":
+    tyro.cli(main)
