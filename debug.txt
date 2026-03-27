@@ -1,12 +1,10 @@
-(openpi_sidenet) mxuan.zhao@ubuntu94:~/openpi_sidenet$ GIT_LFS_SKIP_SMUDGE=1 uv sync 
-warning: The `tool.uv.dev-dependencies` field (used in `packages/openpi-client/pyproject.toml`) is deprecated and will be removed in a future release; use `dependency-groups.dev` instead
-  × No solution found when resolving dependencies for split (markers: python_full_version >= '3.13' and sys_platform == 'darwin'):
-  ╰─▶ Because tensorflow-cpu==2.15.0 depends on ml-dtypes>=0.2.0,<0.3.dev0 and openpi:rlds depends on tensorflow-cpu==2.15.0, we can conclude
-      that openpi:rlds depends on ml-dtypes>=0.2.0,<0.3.dev0.
-      And because openpi:override-dependencies depends on ml-dtypes==0.4.1, we can conclude that openpi:override-dependencies and openpi:rlds
-      are incompatible.
-      And because your workspace requires openpi:override-dependencies and openpi:rlds, we can conclude that your workspace's requirements
-      are unsatisfiable.
+GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+warning: The `tool.uv.dev-dependencies` field (used in `packages/openpi-client/pyproject.toml`) is deprecated and will be removed in a future re
+lease; use `dependency-groups.dev` instead                                                                                                      Using Python 3.14.3 environment at: /home/mxuan.zhao/miniconda3/envs/openpi_sidenet
+  × No solution found when resolving dependencies:
+  ╰─▶ Because torch==2.7.1 has no wheels with a matching Python ABI tag (e.g., `cp314`) and openpi==0.1.0 depends on torch==2.7.1, we can
+      conclude that openpi==0.1.0 cannot be used.
+      And because only openpi==0.1.0 is available and you require openpi, we can conclude that your requirements are unsatisfiable.
 
-      hint: While the active Python version is 3.11, the resolution failed for other Python versions supported by your project. Consider
-      limiting your project's supported Python versions using `requires-python`.
+      hint: You require CPython 3.14 (`cp314`), but we only found wheels for `torch` (v2.7.1) with the following Python ABI tags: `cp39`,
+      `cp310`, `cp311`, `cp312`, `cp313`, `cp313t`
