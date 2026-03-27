@@ -20,8 +20,9 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.samsung_policy as samsung_policy
 import openpi.shared.download as _download
-import openpi.shared.normalize as _normalize
+import openpi.shared.normalize as _norƒmalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
@@ -89,6 +90,11 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+
+    # FIX: optional temporal window size for force/torque data. When set on a
+    # LeRobot-style dataset, the training loader can wrap the dataset and expose
+    # `observation.ft_sensor_window` without changing the rest of the pipeline.
+    ft_window_size: int | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -277,6 +283,67 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             action_sequence_keys=self.action_sequence_keys,
         )
 
+#TODO: Samsung data config
+@dataclasses.dataclass(frozen=True)
+class SamsungDataConfig(DataConfigFactory):
+    # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
+    # Gripper dimensions will remain in absolute values.
+    use_delta_joint_actions: bool = True
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+    # If true, this will convert the joint and gripper values from the standard Aloha space to
+    # the space used by the pi internal runtime which was used to train the base model. People who
+    # use standard Aloha data should set this to true.
+    adapt_to_pi: bool = True
+
+    # Repack transforms.
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation.images.cam_high_left": "observation.images.cam_high_left",
+                        "observation.images.cam_high_right": "observation.images.cam_high_right",
+                        "observation.images.cam_left_wrist": "observation.images.cam_left_wrist",
+                        "observation.images.cam_right_wrist": "observation.images.cam_right_wrist",
+                        "observation.state": "observation.state",
+                        "observation.ft_sensor": "observation.ft_sensor",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+    )
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("action",)
+    # FIX: optional number of historical F/T frames to expose as
+    # `observation.ft_sensor_window`.
+    ft_window_size: int | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[samsung_policy.SamsungInputs(model_type=model_config.model_type)],
+            outputs=[samsung_policy.SamsungOutputs()],
+        )
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, 7, 7, -1, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            ft_window_size=self.ft_window_size,
+        )
+
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotLiberoDataConfig(DataConfigFactory):
@@ -460,10 +527,69 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
+        
+import dataclasses
+from collections.abc import Mapping
+
+# TODO: add training configs for sidenet
+@dataclasses.dataclass(frozen=True)
+class SideNetCheckpointConfig:
+    # Whether to save the base pi05 model weights during training.
+    save_base_pi05: bool = False
+
+    # Whether to save the full SideNet weights as one checkpoint.
+    save_sidenet_full: bool = True
+
+    # Whether to additionally save each SideNet branch separately.
+    save_sidenet_branches: bool = False
+
+    # Whether to save shared SideNet components (fusion, injectors, gates, and
+    # fusion vectors) as a standalone checkpoint artifact.
+    save_shared_parts: bool = False
+
+    # Optional override directory for SideNet training checkpoints. If None,
+    # the standard TrainConfig.checkpoint_dir is used.
+    sidenet_checkpoint_dir: str | None = None
+
+    # Optional path to a full SideNet checkpoint for initialization/resume.
+    load_sidenet_full_path: str | None = None
+
+    # Optional per-branch checkpoint paths, e.g.
+    # {"force_torque": "/path/to/force_torque.safetensors"}
+    load_sidenet_branch_paths: Mapping[str, str] = dataclasses.field(default_factory=dict)
+
+    # If true, load the shared SideNet components from `shared_parts_path`
+    # instead of relying only on the full SideNet checkpoint.
+    load_shared_parts_separately: bool = False
+
+    # Optional path to a standalone shared-parts checkpoint.
+    shared_parts_path: str | None = None
+
+    # Whether SideNet checkpoint loading should be strict.
+    strict_sidenet_load: bool = True
+
+@dataclasses.dataclass(frozen=True)
+class SideNetTrainConfig:
+    # Whether to instantiate the SideNet wrapper instead of the base PyTorch model.
+    enabled: bool = False
+    # Path to sidenet_config.yaml. If None, the side-network training script may
+    # choose its own default.
+    config_path: str | None = None
+    # If true, jointly train pi05 and SideNet. If false, only SideNet is trained.
+    train_pi05: bool = False
+    # FIX: which Observation modality keys should be forwarded into SideNet.
+    modalities: Sequence[str] = ()
+    # Enable/disable the two currently implemented injection routes.
+    use_backbone_injector: bool = True
+    use_expert_injector: bool = True
+    # If non-empty, only these SideNet branches will remain trainable.
+    trainable_branches: Sequence[str] = ()
+    checkpoint: SideNetCheckpointConfig = dataclasses.field(default_factory=SideNetCheckpointConfig)
 
 
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
+
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
     # Project name.
@@ -524,6 +650,9 @@ class TrainConfig:
 
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
+
+    # Side-network training configuration.
+    sidenet: SideNetTrainConfig = dataclasses.field(default_factory=SideNetTrainConfig)
 
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
@@ -965,10 +1094,85 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
+    TrainConfig(
+        name="debug_pytorch_smoke",
+        data=FakeDataConfig(),
+        batch_size=1,
+        num_workers=0,
+        log_interval=1,
+        save_interval=1,
+        pytorch_training_precision="float32",
+        model=pi0_config.Pi0Config(
+            dtype="float32",
+            paligemma_variant="smoke_paligemma",
+            action_expert_variant="smoke_action_expert",
+        ),
+        overwrite=True,
+        exp_name="debug_pytorch_smoke",
+        num_train_steps=2,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_pi05_smoke",
+        data=FakeDataConfig(),
+        batch_size=1,
+        num_workers=0,
+        log_interval=1,
+        save_interval=1,
+        pytorch_training_precision="float32",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            dtype="float32",
+            paligemma_variant="smoke_paligemma",
+            action_expert_variant="smoke_action_expert",
+            action_dim=32,
+            action_horizon=16,
+        ),
+        overwrite=True,
+        exp_name="debug_pi05_smoke",
+        num_train_steps=2,
+        wandb_enabled=False,
+    ),
+    #TODO: SideNet Configs
+    TrainConfig(
+        name="pi05_with_sidenet",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,  # pi05 is trained with 32-dim actions
+            action_horizon=16,
+        ),
+        data=SamsungDataConfig(
+            repo_id="physical-intelligence/aloha_pen_uncap_diverse",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi0_base/assets",
+                asset_id="trossen",
+            ),
+            default_prompt="uncap the pen",
+        ),
+        #weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        pytorch_weight_path="/path/to/pi05_pytorch_checkpoint_dir",
+        sidenet=SideNetTrainConfig(
+            enabled=True,
+            config_path="./sidenet/sidenet_config.yaml",
+            train_pi05=False,
+            # FIX: modalities are now keyed by Observation.modalities / SideNet
+            # branch names instead of raw dataset keys.
+            modalities=("force_torque",),
+            use_backbone_injector=True,
+            use_expert_injector=True,
+            checkpoint=SideNetCheckpointConfig(
+                save_base_pi05=False,
+                save_sidenet_full=True,
+                save_sidenet_branches=True,
+            ),
+        ),
+        num_train_steps=20_000,
+    ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
 ]
+
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

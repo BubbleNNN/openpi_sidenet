@@ -52,7 +52,15 @@ class Config:
     lora_configs: dict[str, lora.LoRAConfig] = dataclasses.field(default_factory=dict)
 
 
-Variant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora"]
+Variant = Literal[
+    "dummy",
+    "smoke_paligemma",
+    "smoke_action_expert",
+    "gemma_300m",
+    "gemma_300m_lora",
+    "gemma_2b",
+    "gemma_2b_lora",
+]
 
 
 def get_config(variant: Variant) -> Config:
@@ -65,6 +73,30 @@ def get_config(variant: Variant) -> Config:
             num_heads=8,
             num_kv_heads=1,
             head_dim=16,
+        )
+    if variant == "smoke_paligemma":
+        # CPU-friendly PaliGemma debug config that keeps the 2048-wide language
+        # stream required by the fixed vision projection path in the PyTorch
+        # implementation, while shrinking depth/MLP cost.
+        return Config(
+            width=2048,
+            depth=2,
+            mlp_dim=2048,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=256,
+        )
+    if variant == "smoke_action_expert":
+        # Lightweight action expert for smoke tests. It keeps the same attention
+        # head geometry as the production path so the shared attention code
+        # remains valid, but reduces hidden size and depth substantially.
+        return Config(
+            width=256,
+            depth=2,
+            mlp_dim=512,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=256,
         )
     if variant == "gemma_300m":
         # 311M params

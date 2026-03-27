@@ -105,10 +105,28 @@ class Observation(Generic[ArrayT]):
     token_ar_mask: at.Int[ArrayT, "*b l"] | None = None
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
+    # FIX: carry any SideNet or other auxiliary modalities alongside the
+    # standard observation fields so training and inference can stay on the
+    # standard `(Observation, actions)` interface.
+    modalities: dict[str, ArrayT] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
+        # FIX: keep all non-standard observation keys as auxiliary modalities
+        # so wrapper models like SideNet can consume them without bypassing the
+        # standard Observation interface.
+        standard_keys = {
+            "image",
+            "image_mask",
+            "state",
+            "tokenized_prompt",
+            "tokenized_prompt_mask",
+            "token_ar_mask",
+            "token_loss_mask",
+            "actions",
+        }
+        modalities = {key: value for key, value in data.items() if key not in standard_keys} or None
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
@@ -116,8 +134,16 @@ class Observation(Generic[ArrayT]):
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
                 data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
-            elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
-                data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+            elif isinstance(data["image"][key], torch.Tensor):
+                # FIX: normalize PyTorch image tensors onto the BCHW convention
+                # expected by the PyTorch pi0/pi05 path, even when they arrive
+                # as float BHWC tensors from fake/debug data.
+                image = data["image"][key]
+                if image.dtype == torch.uint8:
+                    image = image.to(torch.float32) / 255.0 * 2.0 - 1.0
+                if image.ndim >= 4 and image.shape[-1] == 3 and image.shape[1] != 3:
+                    image = image.permute(0, 3, 1, 2)
+                data["image"][key] = image
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
@@ -126,6 +152,7 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            modalities=modalities,
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -133,6 +160,9 @@ class Observation(Generic[ArrayT]):
         result = dataclasses.asdict(self)
         result["image"] = result.pop("images")
         result["image_mask"] = result.pop("image_masks")
+        # FIX: round-trip auxiliary modalities through the dict interface.
+        modalities = result.pop("modalities") or {}
+        result.update(modalities)
         return result
 
 
@@ -205,6 +235,7 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        modalities=observation.modalities,
     )
 
 

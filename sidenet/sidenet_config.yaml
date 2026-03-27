@@ -1,0 +1,39 @@
+branches:
+  force_torque:
+    encoder:
+      type: cnn_encoder
+      params:
+        in_channels: 6
+        mid_channels: 64
+        out_channels: 128
+    projector:
+      type: mlp_projector
+      params:
+        in_features: 128
+        hidden_features: 256
+        out_features: 512
+    refiner:
+      type: attn_refiner
+      params:
+        in_features: 512
+        num_heads: 4
+fusion:
+  type: crossattn_fusion
+  params:
+    in_features: 512
+    num_heads: 4
+injector:
+  backbone:
+    position: cross_attention
+    type: mlp_injector
+    params:
+      in_features: 512
+      hidden_features: 1024
+      out_features: 2048
+  expert:
+    position: adarmsnorm
+    type: mlp_injector
+    params:
+      in_features: 512
+      hidden_features: 1024
+      out_features: 1024

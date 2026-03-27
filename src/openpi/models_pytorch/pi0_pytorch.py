@@ -90,6 +90,19 @@ class PI0Pytorch(nn.Module):
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
 
+        # The PyTorch PaliGemma path uses a fixed 2048-dim vision projection in
+        # `gemma_pytorch.py`, so the language stream must also stay 2048-wide.
+        # Small variants like `dummy` are therefore not valid PyTorch smoke
+        # configs even though they exist in the shared Gemma registry.
+        if paligemma_config.width != 2048:
+            raise ValueError(
+                "PyTorch PI0/PI05 requires a paligemma variant with width=2048 "
+                "because the vision tower projection_dim is fixed to 2048. "
+                f"Got paligemma_variant={config.paligemma_variant!r} "
+                f"(width={paligemma_config.width}). Use 'gemma_2b', "
+                "'gemma_2b_lora', or the smoke-test-only 'smoke_paligemma' variant."
+            )
+
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             paligemma_config,
             action_expert_config,

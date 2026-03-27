@@ -15,6 +15,7 @@ import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
+from sidenet.ft_window_dataset import FTWindowDatasetWrapper
 
 T_co = TypeVar("T_co", covariant=True)
 
@@ -145,6 +146,12 @@ def create_torch_dataset(
         },
     )
 
+    # FIX: when configured, build a same-episode F/T history window at the
+    # dataset layer so the rest of the training pipeline can keep using the
+    # standard sample/batch interfaces.
+    if data_config.ft_window_size is not None:
+        dataset = FTWindowDatasetWrapper(dataset, window_size=data_config.ft_window_size)
+
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
@@ -179,7 +186,10 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
                 "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
             )
         norm_stats = data_config.norm_stats
-
+    #TODO: These are all specified in the config.py->DataConfig. repack transforms renames keys in the input dict
+    # data_transforms process data into the input and output format which is required by the model
+    # Normalize performs state normalizing according to the computed norm_states
+    # model_transforms performs: inject default prompt if prompt is missing ->tokenize prompt -> pad states and actions to the desired length by the model. this will only be perfomed on data['state'] and datat['action']
     return TransformedDataset(
         dataset,
         [
