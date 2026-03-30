@@ -1142,15 +1142,11 @@ _CONFIGS = [
             action_horizon=16,
         ),
         data=SamsungDataConfig(
-            repo_id="physical-intelligence/aloha_pen_uncap_diverse",
-            assets=AssetsConfig(
-                assets_dir="gs://openpi-assets/checkpoints/pi0_base/assets",
-                asset_id="trossen",
-            ),
-            default_prompt="uncap the pen",
+            repo_id="/robot_share/dataset/lerobot/water_hose_insertion/lerobot_260324_to_260325_water_hose_assembly_v3_rby1_410s",
+            default_prompt="Insert the right water hose into the hole",
+            ft_window_size=6,
         ),
-        #weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        pytorch_weight_path="/path/to/pi05_pytorch_checkpoint_dir",
+        pytorch_weight_path="/robot_share/model/SR_pi05_base/Pi_05_Pretrain_Weights_200000",
         sidenet=SideNetTrainConfig(
             enabled=True,
             config_path="./sidenet/sidenet_config.yaml",

@@ -10,12 +10,26 @@ from transformers import AutoProcessor
 import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
 import openpi.shared.download as download
 
+_LOCAL_PALIGEMMA_TOKENIZER_PATH = "/robot_share/model/pretrain_model/tokenizers/big_vision/paligemma_tokenizer.model"
+_DEFAULT_PALIGEMMA_TOKENIZER_PATH = "gs://big_vision/paligemma_tokenizer.model"
+
+
+def _maybe_download_paligemma_tokenizer():
+    # FIX: prefer the server-local tokenizer path recorded in debug.txt, but
+    # fall back to the original GCS path if the local file is unavailable.
+    tokenizer_path = (
+        _LOCAL_PALIGEMMA_TOKENIZER_PATH
+        if os.path.exists(_LOCAL_PALIGEMMA_TOKENIZER_PATH)
+        else _DEFAULT_PALIGEMMA_TOKENIZER_PATH
+    )
+    return download.maybe_download(tokenizer_path, gs={"token": "anon"})
+
 
 class PaligemmaTokenizer:
     def __init__(self, max_len: int = 48):
         self._max_len = max_len
 
-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        path = _maybe_download_paligemma_tokenizer()
         with path.open("rb") as f:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
@@ -53,7 +67,7 @@ class FASTTokenizer:
         self._max_len = max_len
 
         # Download base PaliGemma tokenizer
-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        path = _maybe_download_paligemma_tokenizer()
         with path.open("rb") as f:
             self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
@@ -155,7 +169,7 @@ class BinningTokenizer:
         self._n_bins = n_bins
 
         # Download base PaliGemma tokenizer
-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        path = _maybe_download_paligemma_tokenizer()
         with path.open("rb") as f:
             self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
@@ -291,7 +305,7 @@ class FSQTokenizer:
         )
 
         # Download base PaliGemma tokenizer
-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        path = _maybe_download_paligemma_tokenizer()
         with path.open("rb") as f:
             self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
