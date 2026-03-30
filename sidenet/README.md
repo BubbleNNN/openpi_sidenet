@@ -241,7 +241,76 @@ Do not use the smoke YAML as your production training YAML unless you explicitly
 
 ---
 
-## 6. Training Config Responsibilities
+## 6. Initialization Strategy
+
+Initialization is intentionally asymmetric:
+
+- base `pi05` is not randomly initialized
+- `pi05` is still loaded from `pytorch_weight_path/model.safetensors`
+- `SideNet` is explicitly initialized in `sidenet/sidenet.py`
+
+The goal is:
+
+- let new SideNet branches start in a learnable state
+- keep the initial write into pretrained `pi05` as close to a no-op as possible
+
+### Branch-local modules
+
+Branch-local modules are initialized with standard layer-wise rules:
+
+- `nn.Linear`
+  - `xavier_uniform_`
+  - bias = `0`
+- `nn.Conv1d` / `nn.Conv2d`
+  - `kaiming_normal_`
+  - bias = `0`
+- `nn.MultiheadAttention`
+  - `in_proj_weight` = `xavier_uniform_`
+  - `in_proj_bias` = `0`
+  - `out_proj.weight` = `xavier_uniform_`
+  - `out_proj.bias` = `0`
+- `nn.LayerNorm` / `nn.BatchNorm1d` / `nn.GroupNorm`
+  - weight = `1`
+  - bias = `0`
+
+This applies to the branch-internal encoder / projector / refiner stack.
+
+### Shared and injection modules
+
+Shared modules are initialized more conservatively.
+
+The code first applies the same standard initialization to:
+
+- `fusion`
+- `injectors`
+
+Then it explicitly makes the initial write path small or zero:
+
+- the last `Linear` layer inside each injector is zero-initialized
+- `modality_gates` are initialized to `0`
+- `fusion_vectors` are initialized to `0`
+- `fusion.alpha_ffn` is initialized to `0`
+- `fusion.attn.out_proj` is initialized to `0`
+- the last `Linear` inside `fusion` is also zero-initialized
+
+Practical consequence:
+
+- at step 0, SideNet branches can produce features
+- but the branch-to-`pi05` injection path starts near zero
+- this reduces the chance of immediately destabilizing the pretrained `pi05` backbone / expert path
+
+This behavior is implemented in:
+
+- `sidenet/sidenet.py`
+  - `SideNet._initialize_weights()`
+  - `SideNet._initialize_branch()`
+  - `SideNet._initialize_module()`
+  - `SideNet._zero_last_linear()`
+  - `SideNet._zero_shared_state()`
+
+---
+
+## 7. Training Config Responsibilities
 
 ### `TrainConfig`
 
@@ -312,7 +381,7 @@ Also note:
 
 ---
 
-## 7. Checkpoint Layout
+## 8. Checkpoint Layout
 
 The split checkpoint layout under one training step is:
 
@@ -375,7 +444,7 @@ is safer when doing partial reuse.
 
 ---
 
-## 8. Training Entry
+## 9. Training Entry
 
 The recommended training entrypoint is:
 
@@ -406,11 +475,13 @@ PYTHONPATH=src:. python -m sidenet.train pi05_with_sidenet \
 
 Note:
 
-- `sidenet/train.py` already logs to TensorBoard, not wandb
-- but the boolean config switch is still named `wandb_enabled`
+- `sidenet/train.py` now logs to both TensorBoard and WandB
+- TensorBoard is always kept locally on the main process
+- `wandb_enabled` controls whether WandB is also initialized
+- WandB is initialized with SSL verification disabled via `wandb.Settings(insecure_disable_ssl=True)`
 - so:
-  - `--wandb-enabled` means "enable TensorBoard logging"
-  - `--no-wandb-enabled` means "disable TensorBoard logging"
+  - `--wandb-enabled` means "enable WandB in addition to TensorBoard"
+  - `--no-wandb-enabled` means "disable WandB but keep TensorBoard"
 
 Expected meaning of `--pytorch-weight-path`:
 
@@ -452,7 +523,7 @@ using a local smoke setup.
 
 ---
 
-## 9. Inference Entry
+## 10. Inference Entry
 
 ### 9.1 Programmatic policy loading
 
@@ -519,7 +590,7 @@ So the standard policy path works again.
 
 ---
 
-## 10. Recommended Config Usage
+## 11. Recommended Config Usage
 
 ### Real experiment config
 
@@ -559,7 +630,7 @@ They are not production training configs.
 
 ---
 
-## 11. What Was Added
+## 12. What Was Added
 
 ### Model / architecture
 
@@ -580,7 +651,7 @@ They are not production training configs.
 
 - `PI05withSideNet`
 - `sidenet/train.py`
-- TensorBoard-based offline logging
+- TensorBoard + WandB dual logging
 - branch trainability control
 - split checkpoints
 
@@ -599,7 +670,7 @@ They are not production training configs.
 
 ---
 
-## 12. Smoke Tests Already Completed
+## 13. Smoke Tests Already Completed
 
 These were actually run locally:
 
@@ -640,7 +711,7 @@ Saved artifacts verified:
 
 ---
 
-## 13. Known Limitations / Not Yet Finished
+## 14. Known Limitations / Not Yet Finished
 
 ### 1. Friendly full-checkpoint mismatch assertion is still incomplete
 
@@ -682,7 +753,7 @@ If you want temporal F/T windows:
 
 ---
 
-## 14. Recommended Next Steps
+## 15. Recommended Next Steps
 
 If continuing from here, the most valuable next items are:
 
@@ -694,7 +765,7 @@ If continuing from here, the most valuable next items are:
 
 ---
 
-## 15. Practical Summary
+## 16. Practical Summary
 
 If you only remember three things:
 

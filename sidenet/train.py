@@ -41,8 +41,8 @@ import torch
 import torch.distributed as dist
 import torch.nn.parallel
 import tqdm
-# FIX: replace wandb with local TensorBoard logging for offline training.
 from torch.utils.tensorboard import SummaryWriter
+import wandb
 
 import openpi.models.pi0_config
 import openpi.models.model as _model
@@ -103,13 +103,9 @@ def init_logging():
         logger.handlers[0].setFormatter(formatter)
 
 
-# FIX: TensorBoard initialization replaces the original wandb initialization.
+# FIX: keep local TensorBoard logging alongside WandB instead of replacing it.
 def init_tensorboard(config: _config.TrainConfig, *, enabled: bool = True) -> SummaryWriter | None:
-    """Initialize local TensorBoard logging.
-
-    We intentionally keep using `config.wandb_enabled` as the boolean switch so
-    existing training configs continue to work without additional config edits.
-    """
+    """Initialize local TensorBoard logging."""
     if not enabled:
         return None
 
@@ -122,6 +118,34 @@ def init_tensorboard(config: _config.TrainConfig, *, enabled: bool = True) -> Su
     writer = SummaryWriter(log_dir=str(log_dir))
     writer.add_text("run/config", repr(dataclasses.asdict(config)), global_step=0)
     return writer
+
+
+# FIX: restore WandB logging while explicitly disabling SSL verification for
+# environments that intercept HTTPS traffic.
+def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = True):
+    """Initialize WandB logging."""
+    if not enabled:
+        return None
+
+    ckpt_dir = get_training_checkpoint_dir(config)
+    if not ckpt_dir.exists():
+        raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
+
+    os.environ.setdefault("WANDB_INSECURE_DISABLE_SSL", "true")
+    settings = wandb.Settings(insecure_disable_ssl=True)
+
+    if resuming:
+        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
+        return wandb.init(id=run_id, resume="must", project=config.project_name, settings=settings)
+
+    run = wandb.init(
+        name=config.exp_name,
+        config=dataclasses.asdict(config),
+        project=config.project_name,
+        settings=settings,
+    )
+    (ckpt_dir / "wandb_id.txt").write_text(run.id)
+    return run
 
 
 def setup_ddp():
@@ -404,7 +428,8 @@ def initialize_sidenet_from_config(model, config: _config.TrainConfig, device: t
         load_shared_parts_checkpoint(unwrapped_model, ckpt_cfg.shared_parts_path, device)
 
 
-# FIX: checkpoint logging now writes checkpoint step to TensorBoard instead of wandb.
+# FIX: checkpoint logging now writes checkpoint step to both TensorBoard and
+# WandB when enabled.
 def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, writer: SummaryWriter | None = None):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
@@ -464,9 +489,11 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config,
 
         logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
 
-        # Log checkpoint to TensorBoard
+        # Log checkpoint to TensorBoard and WandB.
         if writer is not None:
             writer.add_scalar("checkpoint/step", global_step, global_step)
+        if config.wandb_enabled and wandb.run is not None:
+            wandb.log({"checkpoint/step": global_step}, step=global_step)
 
 
 def load_checkpoint(model, optimizer, checkpoint_dir, device):
@@ -644,10 +671,12 @@ def train_loop(config: _config.TrainConfig):
         # For resume, checkpoint_dir is already set to the experiment directory
         logging.info(f"Using existing experiment checkpoint directory: {checkpoint_dir}")
 
-    # FIX: initialize TensorBoard writer (only on main process).
+    # FIX: initialize both TensorBoard and WandB on the main process.
     writer = None
+    wandb_run = None
     if is_main:
-        writer = init_tensorboard(config, enabled=config.wandb_enabled)
+        writer = init_tensorboard(config, enabled=True)
+        wandb_run = init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
     # Build data loader using the unified data loader
     # Calculate effective batch size per GPU for DDP
@@ -661,9 +690,9 @@ def train_loop(config: _config.TrainConfig):
     # Pass the original batch size to data loader - it will handle DDP splitting internally
     loader, data_config = build_datasets(config)
 
-    # FIX: preview sample images through TensorBoard while staying on the
+    # FIX: preview sample images through TensorBoard and WandB while staying on the
     # standard `(Observation, actions)` loader contract.
-    if is_main and config.wandb_enabled and not resuming:
+    if is_main and not resuming:
         # Create a separate data loader for sample batch to avoid consuming the main loader
         sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
         sample_observation, sample_actions = next(iter(sample_data_loader))
@@ -679,6 +708,11 @@ def train_loop(config: _config.TrainConfig):
             img_concatenated = img_concatenated.cpu()
             if writer is not None:
                 writer.add_image(f"camera_views/sample_{i}", img_concatenated, 0, dataformats="HWC")
+            if config.wandb_enabled and wandb.run is not None:
+                wandb.log(
+                    {f"camera_views/sample_{i}": wandb.Image(img_concatenated.numpy())},
+                    step=0,
+                )
 
         # Clear sample batch from memory aggressively
         del sample_batch, img_concatenated
@@ -936,13 +970,22 @@ def train_loop(config: _config.TrainConfig):
                     else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
                 )
 
-                # FIX: log training scalars to TensorBoard instead of wandb.
+                # FIX: log training scalars to both TensorBoard and WandB.
                 if writer is not None and len(infos) > 0:
                     writer.add_scalar("train/loss", avg_loss, global_step)
                     writer.add_scalar("train/learning_rate", avg_lr, global_step)
                     writer.add_scalar("train/time_per_step", elapsed / config.log_interval, global_step)
                     if avg_grad_norm is not None:
                         writer.add_scalar("train/grad_norm", avg_grad_norm, global_step)
+                if config.wandb_enabled and wandb.run is not None and len(infos) > 0:
+                    log_payload = {
+                        "train/loss": avg_loss,
+                        "train/learning_rate": avg_lr,
+                        "train/time_per_step": elapsed / config.log_interval,
+                    }
+                    if avg_grad_norm is not None:
+                        log_payload["train/grad_norm"] = avg_grad_norm
+                    wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()
                 infos = []  # Reset stats collection
@@ -964,6 +1007,8 @@ def train_loop(config: _config.TrainConfig):
 
     if writer is not None:
         writer.close()
+    if wandb_run is not None:
+        wandb.finish()
 
     cleanup_ddp()
 
