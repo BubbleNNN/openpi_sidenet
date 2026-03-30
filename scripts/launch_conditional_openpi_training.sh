@@ -2,15 +2,20 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
+LAUNCH_LOG_DIR="${LAUNCH_LOG_DIR:-${REPO_ROOT}/launcher_logs}"
+WANDB_MODE="${WANDB_MODE:-offline}"
+mkdir -p "$LAUNCH_LOG_DIR"
+
 # Configuration
-# Fill these in with your real training commands.
 # The script will prepend CUDA_VISIBLE_DEVICES automatically.
-SIDENET_PI05_CMD='__FILL_ME__'
-PI05_FINETUNE_CMD='__FILL_ME__'
+SIDENET_PI05_CMD="cd \"$REPO_ROOT\" && torchrun --standalone --nnodes=1 --nproc_per_node=8 -m sidenet.train pi05_with_sidenet --exp-name \"water_hose_sidenet_pi05_${RUN_TAG}\""
 
 # Matching policy:
-# - exact: launch only when free GPU count is exactly 4 or exactly 8
-# - at_least: launch when free GPU count is >= 4 or >= 8
+# - exact: launch only when free GPU count is exactly 8
+# - at_least: launch when free GPU count is >= 8
 MATCH_MODE="${MATCH_MODE:-exact}"
 
 # Polling interval in seconds while waiting for a matching GPU count.
@@ -39,16 +44,6 @@ require_command() {
 }
 
 validate_configuration() {
-  if [[ "$SIDENET_PI05_CMD" == "__FILL_ME__" ]]; then
-    echo "Set SIDENET_PI05_CMD at the top of this script before running it." >&2
-    exit 1
-  fi
-
-  if [[ "$PI05_FINETUNE_CMD" == "__FILL_ME__" ]]; then
-    echo "Set PI05_FINETUNE_CMD at the top of this script before running it." >&2
-    exit 1
-  fi
-
   if [[ "$MATCH_MODE" != "exact" && "$MATCH_MODE" != "at_least" ]]; then
     echo "MATCH_MODE must be 'exact' or 'at_least', got: $MATCH_MODE" >&2
     exit 1
@@ -112,17 +107,30 @@ launch_command() {
   local gpu_ids_csv="$1"
   local command_string="$2"
   local tag="$3"
+  local log_slug="$4"
+  local log_file="${LAUNCH_LOG_DIR}/${log_slug}_${RUN_TAG}.log"
+  local launch_ld_library_path="${LD_LIBRARY_PATH:-}"
 
   echo "[$(timestamp)] Launching ${tag} on GPUs: ${gpu_ids_csv}" >&2
-  CUDA_VISIBLE_DEVICES="$gpu_ids_csv" bash -lc "$command_string" &
+  echo "[$(timestamp)] ${tag} log file: ${log_file}" >&2
+  if [[ -n "${CONDA_PREFIX:-}" ]]; then
+    launch_ld_library_path="${CONDA_PREFIX}/lib${launch_ld_library_path:+:${launch_ld_library_path}}"
+  fi
+  CUDA_VISIBLE_DEVICES="$gpu_ids_csv" \
+  LD_LIBRARY_PATH="$launch_ld_library_path" \
+  PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}${PYTHONPATH:+:$PYTHONPATH}" \
+  WANDB_MODE="$WANDB_MODE" \
+  bash -lc "$command_string" >"$log_file" 2>&1 &
   echo "$!"
 }
 
 main() {
   require_command nvidia-smi
+  require_command torchrun
   validate_configuration
 
   log "Waiting for free GPUs. MATCH_MODE=${MATCH_MODE}, MEM<=${GPU_MEM_USED_THRESHOLD_MB}MB, UTIL<=${GPU_UTIL_THRESHOLD_PERCENT}%"
+  log "WandB mode: ${WANDB_MODE}"
 
   while true; do
     mapfile -t free_gpu_ids < <(get_free_gpu_ids)
@@ -137,34 +145,15 @@ main() {
     log "Free GPUs detected (${free_gpu_count}): $(join_by_comma "${free_gpu_ids[@]}")"
 
     if gpu_count_matches "$free_gpu_count" 8; then
-      sidenet_gpu_ids=("${free_gpu_ids[@]:0:4}")
-      finetune_gpu_ids=("${free_gpu_ids[@]:4:4}")
+      sidenet_gpu_ids=("${free_gpu_ids[@]:0:8}")
 
-      if (( ${#sidenet_gpu_ids[@]} < 4 || ${#finetune_gpu_ids[@]} < 4 )); then
-        log "Matched 8-GPU policy, but failed to allocate two 4-GPU groups. Retrying."
+      if (( ${#sidenet_gpu_ids[@]} < 8 )); then
+        log "Matched 8-GPU policy, but failed to allocate 8 GPUs. Retrying."
         sleep "$CHECK_INTERVAL_SEC"
         continue
       fi
 
-      sidenet_pid="$(launch_command "$(join_by_comma "${sidenet_gpu_ids[@]}")" "$SIDENET_PI05_CMD" "SideNet+PI05 training")"
-      finetune_pid="$(launch_command "$(join_by_comma "${finetune_gpu_ids[@]}")" "$PI05_FINETUNE_CMD" "PI05 finetuning")"
-
-      log "Started SideNet+PI05 training pid=${sidenet_pid}"
-      log "Started PI05 finetuning pid=${finetune_pid}"
-      wait "$sidenet_pid" "$finetune_pid"
-      exit $?
-    fi
-
-    if gpu_count_matches "$free_gpu_count" 4; then
-      sidenet_gpu_ids=("${free_gpu_ids[@]:0:4}")
-
-      if (( ${#sidenet_gpu_ids[@]} < 4 )); then
-        log "Matched 4-GPU policy, but failed to allocate 4 GPUs. Retrying."
-        sleep "$CHECK_INTERVAL_SEC"
-        continue
-      fi
-
-      sidenet_pid="$(launch_command "$(join_by_comma "${sidenet_gpu_ids[@]}")" "$SIDENET_PI05_CMD" "SideNet+PI05 training")"
+      sidenet_pid="$(launch_command "$(join_by_comma "${sidenet_gpu_ids[@]}")" "$SIDENET_PI05_CMD" "SideNet+PI05 training" "sidenet_pi05")"
       log "Started SideNet+PI05 training pid=${sidenet_pid}"
       wait "$sidenet_pid"
       exit $?
