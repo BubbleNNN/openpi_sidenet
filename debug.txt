@@ -184,10 +184,69 @@ def set_seed(seed: int, local_rank: int):
         torch.cuda.manual_seed_all(seed + local_rank)
 
 
-def build_datasets(config: _config.TrainConfig):
-    # Use the unified data loader with PyTorch framework
-    data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=True)
-    return data_loader, data_loader.data_config()
+def split_dataset(dataset, train_ratio: float = 0.99, seed: int = 0):
+    """Split a torch Dataset into train and validation subsets."""
+    n = len(dataset)
+    if n < 2:
+        return dataset, None
+
+    n_train = int(n * train_ratio)
+    n_train = min(max(n_train, 1), n - 1)
+
+    generator = torch.Generator().manual_seed(seed)
+    indices = torch.randperm(n, generator=generator).tolist()
+    train_idx, val_idx = indices[:n_train], indices[n_train:]
+    return torch.utils.data.Subset(dataset, train_idx), torch.utils.data.Subset(dataset, val_idx)
+
+
+def build_datasets(config: _config.TrainConfig, train_ratio: float = 0.99):
+    # Use the unified data loader with PyTorch framework.
+    full_loader = _data.create_data_loader(config, framework="pytorch", shuffle=True)
+    data_config = full_loader.data_config()
+    base_dataset = full_loader._data_loader._data_loader.dataset
+    train_ds, val_ds = split_dataset(base_dataset, train_ratio=train_ratio, seed=config.seed)
+
+    if val_ds is None:
+        return full_loader, None, data_config
+
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    rank = dist.get_rank() if dist.is_initialized() else 0
+
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        train_ds,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
+        drop_last=False,
+    )
+    val_sampler = torch.utils.data.distributed.DistributedSampler(
+        val_ds,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False,
+        drop_last=False,
+    )
+
+    def make_loader(subset, sampler, shuffle: bool, drop_last: bool):
+        return _data.DataLoaderImpl(
+            data_config,
+            _data.TorchDataLoader(
+                subset,
+                local_batch_size=config.batch_size // world_size,
+                sharding=None,
+                shuffle=shuffle,
+                sampler=sampler,
+                drop_last=drop_last,
+                num_batches=None,
+                num_workers=config.num_workers,
+                seed=config.seed,
+                framework="pytorch",
+            ),
+        )
+
+    train_loader = make_loader(train_ds, train_sampler, shuffle=True, drop_last=True)
+    val_loader = make_loader(val_ds, val_sampler, shuffle=False, drop_last=False)
+    return train_loader, val_loader, data_config
 
 
 def get_model_state_dict(model):
@@ -211,6 +270,144 @@ def get_model_parameters(model):
 def unwrap_model(model):
     """Remove the DDP wrapper when present."""
     return model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+
+
+def _tensor_to_float(value) -> float:
+    if isinstance(value, torch.Tensor):
+        return float(value.detach().to(dtype=torch.float32).item())
+    return float(value)
+
+
+def _mean_scalar_dicts(infos: list[dict[str, float]]) -> dict[str, float]:
+    aggregated: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for info in infos:
+        for key, value in info.items():
+            aggregated[key] = aggregated.get(key, 0.0) + float(value)
+            counts[key] = counts.get(key, 0) + 1
+    return {key: aggregated[key] / counts[key] for key in aggregated}
+
+
+def _compute_l2_norm(parameters, *, use_grad: bool = False) -> float:
+    sum_sq = None
+    for parameter in parameters:
+        tensor = parameter.grad if use_grad else parameter
+        if tensor is None:
+            continue
+        tensor = tensor.detach().to(dtype=torch.float32)
+        if sum_sq is None:
+            sum_sq = tensor.square().sum()
+        else:
+            sum_sq = sum_sq + tensor.square().sum()
+    if sum_sq is None:
+        return 0.0
+    return float(torch.sqrt(sum_sq).item())
+
+
+def _compute_input_stats(observation: _model.Observation) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+
+    state = observation.state
+    if state is not None:
+        state = state.detach().to(dtype=torch.float32)
+        metrics["input/state_mean"] = float(state.mean().item())
+        metrics["input/state_std"] = float(state.std(unbiased=False).item())
+        metrics["input/state_max_abs"] = float(state.abs().max().item())
+
+    modalities = observation.modalities or {}
+    for key in ("ft_sensor_window", "ft_sensor"):
+        modality = modalities.get(key)
+        if modality is None:
+            continue
+        modality = modality.detach().to(dtype=torch.float32)
+        metrics[f"input/{key}_mean"] = float(modality.mean().item())
+        metrics[f"input/{key}_std"] = float(modality.std(unbiased=False).item())
+        metrics[f"input/{key}_max_abs"] = float(modality.abs().max().item())
+
+    return metrics
+
+
+def _collect_runtime_stats(device: torch.device) -> dict[str, float]:
+    if not torch.cuda.is_available() or device.type != "cuda":
+        return {}
+    return {
+        "gpu/memory_allocated_gb": torch.cuda.memory_allocated(device) / 1e9,
+        "gpu/memory_reserved_gb": torch.cuda.memory_reserved(device) / 1e9,
+    }
+
+
+def _collect_parameter_and_gradient_stats(
+    *,
+    trainable_parameters,
+    pi05_parameters,
+    sidenet_parameters,
+    grad_norm: torch.Tensor | float,
+) -> dict[str, float]:
+    grad_norm_value = _tensor_to_float(grad_norm)
+    param_norm = _compute_l2_norm(trainable_parameters)
+    return {
+        "train/grad_norm": grad_norm_value,
+        "train/param_norm": param_norm,
+        "train/update_ratio": grad_norm_value / max(param_norm, 1e-12),
+        "grad/pi05_norm": _compute_l2_norm(pi05_parameters, use_grad=True),
+        "grad/sidenet_norm": _compute_l2_norm(sidenet_parameters, use_grad=True),
+    }
+
+
+def validate(
+    model,
+    val_loader,
+    *,
+    device: torch.device,
+    config: _config.TrainConfig,
+    requested_modalities: tuple[str, ...],
+) -> dict[str, float] | None:
+    if val_loader is None:
+        return None
+
+    was_training = model.training
+    model.eval()
+
+    totals: dict[str, torch.Tensor] = {}
+    count = torch.zeros(1, device=device, dtype=torch.float32)
+
+    with torch.no_grad():
+        for observation, actions in val_loader:
+            observation = select_observation_modalities(observation, modalities=requested_modalities)
+            observation = move_observation_to_device(observation, device)
+            actions = actions.to(torch.float32).to(device)
+
+            pred_actions = unwrap_model(model).sample_actions(
+                device,
+                observation,
+                use_backbone_injector=config.sidenet.use_backbone_injector,
+                use_expert_injector=config.sidenet.use_expert_injector,
+            )
+            batch_metrics = {
+                "val/loss": torch.nn.functional.mse_loss(pred_actions, actions).detach().to(dtype=torch.float32),
+                "val/action_mse/t0": (pred_actions[:, 0] - actions[:, 0]).detach().to(dtype=torch.float32).square().mean(),
+                "val/action_mse/t_last": (pred_actions[:, -1] - actions[:, -1]).detach().to(dtype=torch.float32).square().mean(),
+                "val/action_mse/mean_over_horizon": (pred_actions - actions).detach().to(dtype=torch.float32).square().mean(),
+            }
+
+            for key, value in batch_metrics.items():
+                if key not in totals:
+                    totals[key] = torch.zeros(1, device=device, dtype=torch.float32)
+                totals[key] += value.reshape(1)
+            count += 1
+
+    if count.item() == 0:
+        model.train(was_training)
+        return None
+
+    if dist.is_initialized():
+        dist.all_reduce(count, op=dist.ReduceOp.SUM)
+        for value in totals.values():
+            dist.all_reduce(value, op=dist.ReduceOp.SUM)
+
+    metrics = {key: float((value / count).item()) for key, value in totals.items()}
+    model.train(was_training)
+    return metrics
 
 
 def resolve_sidenet_modalities(model, config: _config.TrainConfig) -> tuple[str, ...]:
@@ -730,8 +927,10 @@ def train_loop(config: _config.TrainConfig):
         f"Using batch size per GPU: {effective_batch_size} (total batch size across {world_size} GPUs: {config.batch_size})"
     )
 
-    # Pass the original batch size to data loader - it will handle DDP splitting internally
-    loader, data_config = build_datasets(config)
+    # Pass the original batch size to the data loader - it will handle DDP splitting internally.
+    loader, val_loader, data_config = build_datasets(config)
+    if is_main and val_loader is None:
+        logging.warning("Validation logging is disabled because the dataset is too small to create a validation split.")
 
     # FIX: preview sample images through TensorBoard and WandB while staying on the
     # standard `(Observation, actions)` loader contract.
@@ -843,6 +1042,9 @@ def train_loop(config: _config.TrainConfig):
     trainable_parameters = [param for param in model.parameters() if param.requires_grad]
     if not trainable_parameters:
         raise ValueError("No trainable parameters remain after applying SideNet training configuration.")
+    unwrapped_model = unwrap_model(model)
+    pi05_parameters = list(unwrapped_model.pi05_model.parameters())
+    sidenet_parameters = list(unwrapped_model.sidenet.parameters())
 
     optim = torch.optim.AdamW(
         trainable_parameters,
@@ -956,7 +1158,11 @@ def train_loop(config: _config.TrainConfig):
                 train_pi05=config.sidenet.train_pi05,
                 use_backbone_injector=config.sidenet.use_backbone_injector,
                 use_expert_injector=config.sidenet.use_expert_injector,
+                return_aux=True,
             )
+            aux_metrics = {}
+            if isinstance(losses, tuple):
+                losses, aux_metrics = losses
             # Ensure losses is a tensor and handle different return types
             if isinstance(losses, list | tuple):
                 losses = torch.stack(losses)
@@ -975,6 +1181,21 @@ def train_loop(config: _config.TrainConfig):
             # Gradient clipping
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
 
+            if is_main:
+                step_metrics = {
+                    "train/loss": loss.item(),
+                    "train/learning_rate": optim.param_groups[0]["lr"],
+                }
+                step_metrics.update(_collect_parameter_and_gradient_stats(
+                    trainable_parameters=trainable_parameters,
+                    pi05_parameters=pi05_parameters,
+                    sidenet_parameters=sidenet_parameters,
+                    grad_norm=grad_norm,
+                ))
+                step_metrics.update({key: _tensor_to_float(value) for key, value in aux_metrics.items()})
+                step_metrics.update(_compute_input_stats(observation))
+                step_metrics.update(_collect_runtime_stats(device))
+
             # Optimizer step
             optim.step()
             optim.zero_grad(set_to_none=True)
@@ -987,50 +1208,37 @@ def train_loop(config: _config.TrainConfig):
 
             # Collect stats
             if is_main:
-                infos.append(
-                    {
-                        "loss": loss.item(),
-                        "learning_rate": optim.param_groups[0]["lr"],
-                        "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                    }
-                )
+                infos.append(step_metrics)
 
             if is_main and (global_step % config.log_interval == 0):
                 elapsed = time.time() - start_time
+                averaged_metrics = _mean_scalar_dicts(infos)
+                averaged_metrics["perf/steps_per_sec"] = len(infos) / max(elapsed, 1e-12)
+                averaged_metrics["perf/samples_per_sec"] = (len(infos) * config.batch_size) / max(elapsed, 1e-12)
 
-                # Average stats over log interval
-                avg_loss = sum(info["loss"] for info in infos) / len(infos)
-                avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
-
-                avg_grad_norm = None
-                if any("grad_norm" in info for info in infos):
-                    vals = [
-                        info["grad_norm"] for info in infos if "grad_norm" in info and info["grad_norm"] is not None
-                    ]
-                    if len(vals) > 0:
-                        avg_grad_norm = sum(vals) / len(vals)
+                avg_loss = averaged_metrics.get("train/loss")
+                avg_lr = averaged_metrics.get("train/learning_rate")
+                avg_grad_norm = averaged_metrics.get("train/grad_norm")
+                avg_param_norm = averaged_metrics.get("train/param_norm")
                 logging.info(
-                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
-                    if avg_grad_norm is not None
-                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
+                    "step=%s loss=%.4f lr=%.2e grad_norm=%.2f param_norm=%.2f steps_per_sec=%.2f time=%.1fs",
+                    global_step,
+                    avg_loss,
+                    avg_lr,
+                    avg_grad_norm if avg_grad_norm is not None else 0.0,
+                    avg_param_norm if avg_param_norm is not None else 0.0,
+                    averaged_metrics["perf/steps_per_sec"],
+                    elapsed,
                 )
 
                 # FIX: log training scalars to both TensorBoard and WandB.
                 if writer is not None and len(infos) > 0:
-                    writer.add_scalar("train/loss", avg_loss, global_step)
-                    writer.add_scalar("train/learning_rate", avg_lr, global_step)
-                    writer.add_scalar("train/time_per_step", elapsed / config.log_interval, global_step)
-                    if avg_grad_norm is not None:
-                        writer.add_scalar("train/grad_norm", avg_grad_norm, global_step)
+                    averaged_metrics["train/time_per_step"] = elapsed / max(len(infos), 1)
+                    for key, value in averaged_metrics.items():
+                        writer.add_scalar(key, value, global_step)
                 if config.wandb_enabled and wandb.run is not None and len(infos) > 0:
-                    log_payload = {
-                        "train/loss": avg_loss,
-                        "train/learning_rate": avg_lr,
-                        "train/time_per_step": elapsed / config.log_interval,
-                    }
-                    if avg_grad_norm is not None:
-                        log_payload["train/grad_norm"] = avg_grad_norm
-                    wandb.log(log_payload, step=global_step)
+                    averaged_metrics["train/time_per_step"] = elapsed / max(len(infos), 1)
+                    wandb.log(averaged_metrics, step=global_step)
 
                 start_time = time.time()
                 infos = []  # Reset stats collection
@@ -1038,6 +1246,28 @@ def train_loop(config: _config.TrainConfig):
             global_step += 1
             # Save checkpoint using the new mechanism
             save_checkpoint(model, optim, global_step, config, is_main, data_config, writer=writer)
+
+            if global_step % config.val_interval == 0:
+                val_metrics = validate(
+                    model,
+                    val_loader,
+                    device=device,
+                    config=config,
+                    requested_modalities=requested_modalities,
+                )
+                if is_main and val_metrics is not None:
+                    logging.info(
+                        "[Step %s] Validation loss=%.4f action_mse_t0=%.4f action_mse_t_last=%.4f",
+                        global_step,
+                        val_metrics["val/loss"],
+                        val_metrics["val/action_mse/t0"],
+                        val_metrics["val/action_mse/t_last"],
+                    )
+                    if writer is not None:
+                        for key, value in val_metrics.items():
+                            writer.add_scalar(key, value, global_step)
+                    if config.wandb_enabled and wandb.run is not None:
+                        wandb.log(val_metrics, step=global_step)
 
             # Update progress bar
             if pbar is not None:
