@@ -8,7 +8,7 @@ import safetensors.torch
 
 import openpi.models.model as _model
 import openpi.policies.policy as _policy
-import openpi.policies.samsung_policy as samsung_policy
+import openpi.policies.rby1_policy as rby1_policy
 import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
@@ -145,6 +145,51 @@ def _load_split_sidenet_policy_model(
     return model
 
 
+def _maybe_wrap_rby1_ft_window_inputs(
+    train_config: _config.TrainConfig,
+    data_config: _config.DataConfig,
+    input_transforms: list[transforms.DataTransformFn],
+) -> list[transforms.DataTransformFn]:
+    if data_config.ft_window_size is None or not isinstance(train_config.data, _config.LeRobotRby1FTDataConfig):
+        return input_transforms
+
+    return [
+        rby1_policy.Rby1FTWindowInputs(
+            action_dim=transform.action_dim,
+            exclude_torso=transform.exclude_torso,
+            use_cam_high_right=transform.use_cam_high_right,
+            exclude_gripper_from_state=transform.exclude_gripper_from_state,
+            window_size=data_config.ft_window_size,
+        )
+        if isinstance(transform, rby1_policy.Rby1Inputs)
+        else transform
+        for transform in input_transforms
+    ]
+
+
+def _load_policy_norm_stats(
+    train_config: _config.TrainConfig,
+    data_config: _config.DataConfig,
+    checkpoint_dir: pathlib.Path,
+) -> dict[str, transforms.NormStats] | None:
+    if data_config.asset_id is None:
+        raise ValueError("Asset id is required to load norm stats.")
+
+    checkpoint_assets_dir = checkpoint_dir / "assets"
+    try:
+        return _checkpoints.load_norm_stats(checkpoint_assets_dir, data_config.asset_id)
+    except FileNotFoundError:
+        logging.warning(
+            "Norm stats not found in checkpoint-local assets at %s/%s; falling back to training config assets.",
+            checkpoint_assets_dir,
+            data_config.asset_id,
+        )
+
+    assets_root = pathlib.Path(train_config.data.assets.assets_dir or train_config.assets_dirs)
+    fallback_assets_dir = pathlib.Path(download.maybe_download(str(assets_root)))
+    return _checkpoints.load_norm_stats(fallback_assets_dir, data_config.asset_id)
+
+
 def create_trained_policy(
     train_config: _config.TrainConfig,
     checkpoint_dir: pathlib.Path | str,
@@ -211,26 +256,15 @@ def create_trained_policy(
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:
-        # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
-        # that the policy is using the same normalization stats as the original training process.
-        if data_config.asset_id is None:
-            raise ValueError("Asset id is required to load norm stats.")
-        norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
+        # Prefer checkpoint-local stats, then fall back to the same assets path
+        # used during training when the checkpoint does not carry a copied copy.
+        norm_stats = _load_policy_norm_stats(train_config, data_config, checkpoint_dir)
 
-    input_transforms = list(data_config.data_transforms.inputs)
-    # FIX: when Samsung inference is configured to use an F/T window, swap in a
-    # stateful transform that maintains the history locally and emits the same
-    # `force_torque` key as training.
-    if data_config.ft_window_size is not None and isinstance(train_config.data, _config.SamsungDataConfig):
-        input_transforms = [
-            samsung_policy.SamsungFTWindowInputs(
-                model_type=transform.model_type,
-                window_size=data_config.ft_window_size,
-            )
-            if isinstance(transform, samsung_policy.SamsungInputs)
-            else transform
-            for transform in input_transforms
-        ]
+    input_transforms = _maybe_wrap_rby1_ft_window_inputs(
+        train_config,
+        data_config,
+        list(data_config.data_transforms.inputs),
+    )
 
     return _policy.Policy(
         model,

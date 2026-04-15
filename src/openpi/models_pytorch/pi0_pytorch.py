@@ -86,7 +86,7 @@ class PI0Pytorch(nn.Module):
         super().__init__()
         self.config = config
         self.pi05 = config.pi05
-
+        self.four_images = config.four_images
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
 
@@ -122,8 +122,8 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
         torch.set_float32_matmul_precision("high")
-        if config.pytorch_compile_mode is not None:
-            self.sample_actions = torch.compile(self.sample_actions, mode=config.pytorch_compile_mode)
+        if config.torch_compile_mode is not None:
+            self.sample_actions = torch.compile(self.sample_actions, mode=config.torch_compile_mode)
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -174,7 +174,11 @@ class PI0Pytorch(nn.Module):
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
-        observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
+        if self.four_images:
+            image_keys = ('base_0_rgb', 'base_1_rgb', 'left_wrist_0_rgb', 'right_wrist_0_rgb')
+            observation = _preprocessing.preprocess_observation_pytorch(observation, train=train, image_keys=image_keys)
+        else:
+            observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
         return (
             list(observation.images.values()),
             list(observation.image_masks.values()),

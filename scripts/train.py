@@ -15,6 +15,7 @@ import numpy as np
 import optax
 import tqdm_loggable.auto as tqdm
 import wandb
+import time
 
 import openpi.models.model as _model
 import openpi.shared.array_typing as at
@@ -26,6 +27,34 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+try:
+    from tensorboardX import SummaryWriter
+    _TENSORBOARD_AVAILABLE = True
+except ImportError:
+    SummaryWriter = None
+    _TENSORBOARD_AVAILABLE = False
+if _TENSORBOARD_AVAILABLE:
+    
+    class TensorboardLogger:
+        def __init__(self, config):
+            self.writer = SummaryWriter(log_dir=str(config.checkpoint_dir / "tensorboard"))
+            
+        def log(self, step:int, scalars: dict[str, float]):
+            for key, value in scalars.items():
+                self.writer.add_scalar(key, value, step)
+        
+        def close(self):
+            self.writer.close()
+else:
+    class TensorboardLogger:
+        def __init__(self, config):
+           self.writer = None
+        
+        def log(self, step:int, scalars: dict[str, float]):
+            pass
+        
+        def close(self):
+            pass
 
 
 def init_logging():
@@ -46,6 +75,19 @@ def init_logging():
     logger.setLevel(logging.INFO)
     logger.handlers[0].setFormatter(formatter)
 
+class LogFile:
+    """text file logging for loss"""
+    
+    def __init__(self, config):
+        ckpt_dir = config.checkpoint_dir
+        if not ckpt_dir.exists():
+            raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
+        self.log_file = ckpt_dir / "loss.log"
+        
+    def write(self, step: int, message: str):
+        time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        with open(self.log_file, "a") as f:
+            f.write(f"{time_str} Step {step}: {message}\n")
 
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
     if not enabled:
@@ -70,7 +112,9 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
         wandb.run.log_code(epath.Path(__file__).parent.parent)
 
 
-def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
+def _load_weights_and_validate(
+    loader: _weight_loaders.WeightLoader, params_shape: at.Params, *, action_dim: int | None = None
+) -> at.Params:
     """Loads and validates the weights. Returns a loaded subset of the weights."""
     loaded_params = loader.load(params_shape)
     at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
@@ -119,7 +163,7 @@ def init_train_state(
     if resume:
         return train_state_shape, state_sharding
 
-    partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict())
+    partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict(), action_dim = config.model.action_dim)
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     # Initialize the train state and mix in the partial params.
@@ -216,6 +260,7 @@ def main(config: _config.TrainConfig):
         resume=config.resume,
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    log_file = LogFile(config)
 
     data_loader = _data_loader.create_data_loader(
         config,
@@ -254,6 +299,7 @@ def main(config: _config.TrainConfig):
         total=config.num_train_steps,
         dynamic_ncols=True,
     )
+    tb_logger = TensorboardLogger(config)
 
     infos = []
     for step in pbar:
@@ -265,9 +311,20 @@ def main(config: _config.TrainConfig):
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
+            log_file.write(step, info_str)
             wandb.log(reduced_info, step=step)
+            tb_logger.log(step, reduced_info)
             infos = []
         batch = next(data_iter)
+        # # 添加以下代码来查看第一个batch的统计信息
+        # observation, actions = batch
+        # actions_arr = np.asarray(actions)
+        # actions_flat = actions_arr.reshape(-1, actions_arr.shape[-1])
+        # print(f"\n{'='*60}")
+        # print(f"[Initial Batch ] Action Per-joint statistics")
+        # print(f"Shape: batch={actions_arr.shape[0]}, horizon = {actions_arr.shape[1]}, joints={actions_arr.shape[2]}")
+        # print(f"{'='*60}")
+        # print(f)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)

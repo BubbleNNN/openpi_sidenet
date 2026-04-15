@@ -39,12 +39,44 @@ import torch.distributed as dist
 import torch.nn.parallel
 import tqdm
 import wandb
+from ema_pytorch import EMA
 
+import openpi.models.model as _model
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
+from openpi.training.utils import visualize_validation_step
+
+try:
+    from tensorboardX import SummaryWriter
+    _TENSORBOARD_AVAILABLE = True
+except ImportError:
+    SummaryWriter = None
+    _TENSORBOARD_AVAILABLE = False
+if _TENSORBOARD_AVAILABLE:
+    
+    class TensorboardLogger:
+        def __init__(self, config):
+            self.writer = SummaryWriter(log_dir=str(config.checkpoint_dir / "tensorboard"))
+            
+        def log(self, step:int, scalars: dict[str, float]):
+            for key, value in scalars.items():
+                self.writer.add_scalar(key, value, step)
+        
+        def close(self):
+            self.writer.close()
+else:
+    class TensorboardLogger:
+        def __init__(self, config):
+           self.writer = None
+        
+        def log(self, step:int, scalars: dict[str, float]):
+            pass
+        
+        def close(self):
+            pass
 
 
 def init_logging():
@@ -69,6 +101,20 @@ def init_logging():
         logger.handlers[0].setFormatter(formatter)
 
 
+class LogFile:
+    """text file logging for loss"""
+    
+    def __init__(self, config):
+        ckpt_dir = config.checkpoint_dir
+        if not ckpt_dir.exists():
+            raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
+        self.log_file = ckpt_dir / "loss.log"
+        
+    def write(self, step: int, message: str):
+        time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        with open(self.log_file, "a") as f:
+            f.write(f"{time_str} Step {step}: {message}\n")
+            
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = True):
     """Initialize wandb logging."""
     if not enabled:
@@ -121,13 +167,121 @@ def set_seed(seed: int, local_rank: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed + local_rank)
 
+def split_dataset(dataset, train_ratio=0.9, seed=0):
+    """split a torch.utils.data.Dataset into train and validation sets"""
+    n = len(dataset)
+    n_train = int(n * train_ratio)
+    generator = torch.Generator().manual_seed(seed)
+    indices = torch.randperm(n, generator=generator).tolist()
+    train_idx, val_idx = indices[:n_train], indices[n_train:]
+    return (torch.utils.data.Subset(dataset, train_idx), torch.utils.data.Subset(dataset, val_idx))
 
-def build_datasets(config: _config.TrainConfig):
+
+
+def build_datasets(config: _config.TrainConfig, train_ratio=0.99):
     # Use the unified data loader with PyTorch framework
-    data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=True)
-    return data_loader, data_loader.data_config()
+    full_loader = _data.create_data_loader(config, framework="pytorch", shuffle=True)
+    data_config = full_loader.data_config()
+    base_dataset = full_loader._data_loader._data_loader.dataset
+    train_ds, val_ds = split_dataset(base_dataset, train_ratio, seed = config.seed)
+    
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        train_ds, num_replicas = world_size, rank = rank, shuffle = True, drop_last = False
+    )
+    val_sampler = torch.utils.data.distributed.DistributedSampler(
+        val_ds, num_replicas = world_size, rank = rank, shuffle = False, drop_last = False
+    )
+    
+    def make_loader(subset, sampler, shuffle, drop_last):
+        return _data.DataLoaderImpl(
+            data_config,
+            _data.TorchDataLoader(
+                subset,
+                local_batch_size = config.batch_size // world_size,
+                sharding = None,
+                shuffle = shuffle,
+                sampler = sampler,
+                drop_last = drop_last,
+                num_batches = None,
+                num_workers = config.num_workers,
+                seed = config.seed,
+                framework = "pytorch",
+            )
+        )
+    
+    train_loader = make_loader(train_ds, train_sampler, shuffle=True, drop_last=True)
+    val_loader = make_loader(val_ds, val_sampler, shuffle=False, drop_last=False)
+    return train_loader, val_loader, full_loader.data_config()
+    
+def validate(model, val_loader, device, global_step, logger = None):
+    was_training = model.training
+    model.eval()
+    
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    
+    total_loss = torch.zeros(1, device=device)
+    count = torch.zeros(1, device=device)
+    
+    desc = f'Validation (Rank {rank}/{world_size})'
 
-
+    pbar = tqdm.tqdm(
+        enumerate(val_loader),
+        total= len(val_loader._data_loader._data_loader),
+        desc = desc ,
+        position=rank,
+        disable=False,
+        dynamic_ncols=True,
+        leave=False,
+    )
+    
+    with torch.no_grad():
+        for step, (obs,actions) in pbar:
+            obs_dict = (
+                jax.tree.map(lambda x: torch.as_tensor(x).to(device), obs.to_dict())
+                if hasattr(obs, "to_dict")
+                else {k:v.to(device) for k,v in obs.items()}
+            )
+            
+            obs_device = _model.Observation.from_dict(obs_dict)
+            
+            pred = (
+                model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+            ).sample_actions(device, obs_device)
+            actions = torch.as_tensor(actions).to(device)
+            
+            loss = torch.nn.functional.mse_loss(pred, actions)
+            
+            total_loss += loss.detach()
+            count += 1
+            
+            pbar.set_postfix({"loss": total_loss.item()})
+            if step == 0 and logger is not None and getattr(logger, "writer", None) is not None:
+                validation_artifact_dir = logger.writer.logdir.replace("tensorboard","validation")
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                validation_artifact_dir = os.path.join(validation_artifact_dir, f"rank_{rank}", f"{global_step:07d}")
+                visualize_validation_step(obs_dict, actions, pred, validation_artifact_dir, pred.shape[0])
+            
+            if step + 1 >= len(val_loader._data_loader._data_loader):
+                break
+    if dist.is_initialized():
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(count, op=dist.ReduceOp.SUM)
+        
+    mean_loss = (total_loss / count).item() if count > 0 else float("nan")
+    
+    if was_training:
+        model.train()
+        
+    if rank == 0:
+        logging.info(f'Step {global_step} : [Validation] Validation artifact {world_size} ranks: {mean_loss:.6f}')
+        logging.info(f'Step {global_step}: [Validation] Mean loss across {world_size} ranks: {mean_loss:.6f}')
+        
+    return mean_loss
+                                       
 def get_model_state_dict(model):
     """Get state dict from model, handling DDP wrapper."""
     return (
@@ -146,7 +300,7 @@ def get_model_parameters(model):
     )
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
+def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, ema: None | EMA= None):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
         return
@@ -165,6 +319,8 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         # Save model state using safetensors (handle shared tensors)
         model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
         safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
+        if ema is not None: 
+            safetensors.torch.save_model(ema.ema_model, tmp_ckpt_dir / "ema.safetensors")
 
         # Save optimizer state using PyTorch format
         torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
@@ -194,7 +350,7 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
             wandb.log({"checkpoint_step": global_step}, step=global_step)
 
 
-def load_checkpoint(model, optimizer, checkpoint_dir, device):
+def load_checkpoint(model, optimizer, checkpoint_dir, device, ema:None | EMA = None):
     """Load the latest checkpoint and return the global step."""
     checkpoint_steps = [
         int(d.name)
@@ -223,6 +379,14 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
             model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
             safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device))
             logging.info("Loaded model state from safetensors format")
+            is_main = not isinstance(model, torch.nn.parallel.DistributedDataParallel) or (
+                dist.is_initialized() and dist.get_rank() == 0
+            )
+            
+            if ema is not None and is_main:
+                ema_path = ckpt_dir / "ema.safetensors"
+                safetensors.torch.load_model(ema.ema_model, ema_path, device = "cpu")
+                logging.info("Loaded ema state from safetensors format")
         else:
             raise FileNotFoundError(f"No model checkpoint found at {ckpt_dir}")
 
@@ -329,8 +493,9 @@ def train_loop(config: _config.TrainConfig):
         else:
             raise FileNotFoundError(f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume")
     elif config.overwrite and config.checkpoint_dir.exists():
-        shutil.rmtree(config.checkpoint_dir)
-        logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
+        if is_main:
+            shutil.rmtree(config.checkpoint_dir)
+            logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
 
     # Create checkpoint directory with experiment name
     if not resuming:
@@ -345,6 +510,7 @@ def train_loop(config: _config.TrainConfig):
     # Initialize wandb (only on main process)
     if is_main:
         init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+        log_file = LogFile(config)
 
     # Build data loader using the unified data loader
     # Calculate effective batch size per GPU for DDP
@@ -356,7 +522,7 @@ def train_loop(config: _config.TrainConfig):
     )
 
     # Pass the original batch size to data loader - it will handle DDP splitting internally
-    loader, data_config = build_datasets(config)
+    loader, val_loader, data_config = build_datasets(config)
 
     # Log sample images to wandb on first batch
     if is_main and config.wandb_enabled and not resuming:
@@ -390,7 +556,17 @@ def train_loop(config: _config.TrainConfig):
         logging.info("Cleared sample batch and data loader from memory")
 
     # Build model
-    if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
+    model_cfg = config.model
+    if type(config.model) is openpi.models.pi0_config.PI0Config:
+        if config.model.use_tactile:
+            model_class = openpi.models_pytorch.pi0_pytorch.PI0TactilePytorch
+        elif config.model.use_force:
+            model_class = openpi.models_pytorch.pi0_pytorch.PI0ForcePytorch
+        else:
+            model_class = openpi.models_pytorch.pi0_pytorch.PI0Pytorch
+    elif type(config.model) is openpi.models.pi05_ki_config.PI05KIConfig:
+        model_class = openpi.models_pytorch.pi0_pytorch.PI05KIPytorch
+    else:
         # Convert dataclass to Pi0Config if needed
         model_cfg = openpi.models.pi0_config.Pi0Config(
             dtype=config.pytorch_training_precision,
@@ -401,12 +577,25 @@ def train_loop(config: _config.TrainConfig):
             action_expert_variant=getattr(config.model, "action_expert_variant", "gemma_300m"),
             pi05=getattr(config.model, "pi05", False),
         )
-    else:
-        model_cfg = config.model
-        # Update dtype to match pytorch_training_precision
-        object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
+        model_class = openpi.models_pytorch.pi0_pytorch.PI0Pytorch
 
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+        # Update dtype to match pytorch_training_precision
+    object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
+
+    model = model_class(model_cfg).to(device)
+    
+    if config.enable_ema_torch:
+        ema = EMA(
+            model, 
+            beta = config.ema_decay,
+            update_after_step =10,
+            update_every = 10,
+            allow_different_devices = True,
+        )
+        ema.eval()
+        ema.ema_model.to('cpu')
+    else:
+        ema = None
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -442,11 +631,31 @@ def train_loop(config: _config.TrainConfig):
     if config.pytorch_weight_path is not None:
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
-        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
-        )
-        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+        model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        safetensors_path = config.pytorch_weight_path
+        state_dict = safetensors.torch.load_file(os.path.join(str(safetensors_path),"model.safetensors"), device = 'cpu')
+        
+        model_dict = model_to_load.state_dict()
+        
+        filtered_state_dict = {}
+        skipped_keys = []
+        for k,v in state_dict.items():
+            if k in model_dict and model_dict[k].shape == v.shape:
+                filtered_state_dict[k] = v
+            else:
+                skipped_keys.append(k)
+                
+        missing, unexpected = model_to_load.load_state_dict(filtered_state_dict, strict=False)
+        
+        logging.info(f'Loaded model state from safetensors format :{safetensors_path}')
+        if skipped_keys:
+            logging.warning(f"Skipped loading weights for {len(skipped_keys)} keys due to shape mismatch: {skipped_keys}")
+        if missing:
+            logging.warning(f"Missing keys in model state dict that were not loaded: {missing}")
+        if unexpected:
+            logging.warning(f"Unexpected keys in checkpoint that do not match model state dict: {unexpected}")
+
+            logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
@@ -466,7 +675,7 @@ def train_loop(config: _config.TrainConfig):
     # Load checkpoint if resuming
     global_step = 0
     if resuming:
-        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device)
+        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device, ema)
         logging.info(f"Resumed training from step {global_step}")
 
     def lr_schedule(step: int):
@@ -496,6 +705,8 @@ def train_loop(config: _config.TrainConfig):
         logging.info(
             f"Optimizer: {type(config.optimizer).__name__}, weight_decay={config.optimizer.weight_decay}, clip_norm={config.optimizer.clip_gradient_norm}"
         )
+        if config.enable_ema_torch:
+            logging.info("EMA is enabled. Warning: EMA resuming is not yet fully implemented")
         logging.info("EMA is not supported for PyTorch training")
         logging.info(f"Training precision: {model_cfg.dtype}")
 
@@ -505,6 +716,7 @@ def train_loop(config: _config.TrainConfig):
         if is_main
         else None
     )
+    tb_logger = TensorboardLogger(config)
 
     while global_step < config.num_train_steps:
         # Set epoch for distributed training
@@ -548,13 +760,55 @@ def train_loop(config: _config.TrainConfig):
             # Optimizer step
             optim.step()
             optim.zero_grad(set_to_none=True)
+            if ema is not None and is_main:
+                ema.update()
 
             # Clear gradients more aggressively
             for param in model.parameters():
                 if param.grad is not None:
                     param.grad.detach_()
                     param.grad = None
+            
+            if (global_step + 1) % config.val_interval == 0:
+                if config.enable_ema_torch and ema is not None:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
+                    if dist.is_initialized():
+                        dist.barrier()
 
+                    ema_temp = model_class(model_cfg).to(device)
+
+                    if is_main:
+                        ema_temp.load_state_dict(ema.ema_model.state_dict(), strict=True)
+
+                    if dist.is_initialized():
+                        for param in ema_temp.parameters():
+                            dist.broadcast(param.data, src=0)
+
+                    ema_temp.eval()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
+                    if dist.is_initialized():
+                        dist.barrier()
+
+                    val_loss = validate(ema_temp, val_loader, device, global_step, tb_logger)
+
+                    ema_temp.to("cpu")
+                    del ema_temp
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
+                    if dist.is_initialized():
+                        dist.barrier()
+                else:
+                    val_loss = validate(model, val_loader, device, global_step, tb_logger)
+
+                if is_main:
+                    logging.info(f"[Step {global_step}] Validation Loss: {val_loss:.4f}")
+                    tb_logger.log(global_step, {"val/loss": val_loss})
+                
             # Collect stats
             if is_main:
                 infos.append(
@@ -584,6 +838,12 @@ def train_loop(config: _config.TrainConfig):
                     if avg_grad_norm is not None
                     else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
                 )
+                log_file.write(
+                    global_step,
+                    f"time={elapsed:.1f}s loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f}"
+                    if avg_grad_norm is not None
+                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s",
+                )
 
                 # Log to wandb
                 if config.wandb_enabled and len(infos) > 0:
@@ -596,13 +856,23 @@ def train_loop(config: _config.TrainConfig):
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
                     wandb.log(log_payload, step=global_step)
-
+                if len(infos) > 0:
+                    log_payload = {
+                        'loss': avg_loss,
+                        'learning_rate': avg_lr,
+                        'step': global_step,
+                        'time_per_step': elapsed / config.log_interval,
+                    }
+                    if avg_grad_norm is not None:
+                        log_payload['grad_norm'] = avg_grad_norm
+                    tb_logger.log(global_step, log_payload)
+                    
                 start_time = time.time()
                 infos = []  # Reset stats collection
 
             global_step += 1
             # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            save_checkpoint(model, optim, global_step, config, is_main, data_config, ema)
 
             # Update progress bar
             if pbar is not None:

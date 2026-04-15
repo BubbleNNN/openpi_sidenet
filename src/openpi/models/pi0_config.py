@@ -1,5 +1,6 @@
 import dataclasses
 from typing import TYPE_CHECKING
+from typing import Literal
 
 import flax.nnx as nnx
 import jax
@@ -20,7 +21,7 @@ class Pi0Config(_model.BaseModelConfig):
     dtype: str = "bfloat16"
     paligemma_variant: _gemma.Variant = "gemma_2b"
     action_expert_variant: _gemma.Variant = "gemma_300m"
-
+    torch_compile_mode: Literal["max-autotune","default"] | None = "default"
     # Set the model specific defaults.
     action_dim: int = 32
     action_horizon: int = 50
@@ -31,12 +32,20 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    discrete_force_input: bool = None
+    
+    four_images: bool = False
+    
+    use_tactile: bool = False
+    use_force: bool = False
+    
+    prefix_force: bool = False
 
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
         if self.max_token_len is None:
-            object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
+            object.__setattr__(self, "max_token_len", 240 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
         if self.pytorch_compile_mode is not None:
@@ -46,6 +55,8 @@ class Pi0Config(_model.BaseModelConfig):
                 "max-autotune",
                 "max-autotune-no-cudagraphs",
             ]
+        if self.discrete_force_input is None:
+            object.__setattr__(self, "discrete_force_input", self.pi05 and self.use_force)
 
     @property
     @override

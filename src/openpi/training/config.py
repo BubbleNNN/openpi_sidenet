@@ -6,6 +6,7 @@ import dataclasses
 import difflib
 import logging
 import pathlib
+import json
 from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
@@ -15,20 +16,26 @@ import tyro
 
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
+import openpi.models.pi05_ki_config as pi05_ki_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.samsung_policy as samsung_policy
+import openpi.policies.rby1_policy as rby1_policy
+import policies.rby1_xhand_policy as rby1_xhand_policy
 import openpi.shared.download as _download
-import openpi.shared.normalize as _norƒmalize
+import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
+import sidenet.jax.pi05_with_sidenet as pi05_with_sidenet_jax
+
+from openpi.policies.rby1_policy import RBY1_ACTION_DIM
 
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
@@ -102,6 +109,9 @@ class DataConfig:
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+    data_from_file: bool = False
+    dataset_file_path:str|None = None
+    filter_dict_path: str | None = None
 
 
 class GroupFactory(Protocol):
@@ -138,9 +148,22 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
+                            discrete_force_input=model_config.discrete_force_input,
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
+                )
+            case _model.ModelType.PI05_KI:
+                assert isinstance(model_config, pi05_ki_config.PI05KiConfig)
+                return _transforms.Group(
+                    inputs = [
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.TokenizePromptFAST(
+                            _tokenizer.PaligemmaFASTTokenizer(model_config.max_token_len),
+                        ),
+                        _transforms.PadStatesAndActions(model_config.action_dim),
+                    ]
                 )
             case _model.ModelType.PI0_FAST:
                 tokenizer_cls = (
@@ -190,7 +213,8 @@ class DataConfigFactory(abc.ABC):
             repo_id=repo_id,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
-            use_quantile_norm=model_config.model_type != ModelType.PI0,
+            #use_quantile_norm=model_config.model_type != ModelType.PI0,
+            use_quantile_norm = False,
         )
 
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
@@ -308,6 +332,7 @@ class SamsungDataConfig(DataConfigFactory):
                         "observation.images.cam_right_wrist": "observation.images.cam_right_wrist",
                         "observation.state": "observation.state",
                         "observation.ft_sensor": "observation.ft_sensor",
+                        "observation.ft_sensor_window": "observation.ft_sensor_window",
                         "actions": "action",
                     }
                 )
@@ -319,6 +344,25 @@ class SamsungDataConfig(DataConfigFactory):
     # FIX: optional number of historical F/T frames to expose as
     # `observation.ft_sensor_window`.
     ft_window_size: int | None = None
+
+    # FIX: SamsungInputs renames raw F/T fields to `force_torque` before
+    # Normalize runs. Alias any existing single-frame F/T stats onto that key at
+    # runtime so we do not need to rewrite on-disk norm_stats.json files.
+    @staticmethod
+    def _alias_force_torque_norm_stats(
+        norm_stats: dict[str, _transforms.NormStats] | None,
+    ) -> dict[str, _transforms.NormStats] | None:
+        if norm_stats is None or "force_torque" in norm_stats:
+            return norm_stats
+
+        for source_key in ("observation.ft_sensor", "ft_sensor"):
+            if source_key in norm_stats:
+                aliased_stats = dict(norm_stats)
+                aliased_stats["force_torque"] = norm_stats[source_key]
+                logging.info("Aliased norm stats key `%s` -> `force_torque` for Samsung inputs.", source_key)
+                return aliased_stats
+
+        return norm_stats
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -334,17 +378,239 @@ class SamsungDataConfig(DataConfigFactory):
             )
 
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        # FIX: apply the runtime force-torque alias after loading norm stats from
+        # assets, so Normalize can match the Samsung transform output key.
+        base_config = self.create_base_config(assets_dirs, model_config)
 
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            base_config,
             repack_transforms=self.repack_transforms,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
             ft_window_size=self.ft_window_size,
+            norm_stats=self._alias_force_torque_norm_stats(base_config.norm_stats),
         )
 
+@dataclasses.dataclass(frozen = True)
+class LeRobotRby1DataConfig(DataConfigFactory):
+    use_delta_joint_actions: bool = True
+    default_prompt: str | None = None
+    exclude_torso: bool = False
+    use_cam_high_right: bool = False
+    exclude_gripper_from_state: bool = False
+    use_quantile_norm: bool | None = None
+    
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default = _transforms.Group(
+            inputs = [
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high_left":"observation.images.cam_high_left",
+                            "cam_high_right":"observation.images.cam_high_right",
+                            "cam_left_wrist":"observation.images.cam_left_wrist",
+                            "cam_right_wrist":"observation.images.cam_right_wrist"
+                        },
+                        "state":"observation.state",
+                        "actions":"action",
+                        "prompt":"prompt"
+                    }
+                )
+            ]
+        )
+    )
+    action_sequence_keys: Sequence[str] = ("action",)
 
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        base_data_config = self.create_base_config(assets_dirs, model_config)
+        if self.use_quantile_norm is not None:
+            base_data_config = dataclasses.replace(
+                base_data_config,
+                use_quantile_norm = self.use_quantile_norm,
+            )
+        if self.exclude_gripper_from_state:
+            if base_data_config.norm_stats is not None and "state" in base_data_config.norm_stats:
+                norm_stats = base_data_config.norm_stats.copy()
+                start_idx = 6 if self.exclude_torso else 0
+                valid_action_dim = RBY1_ACTION_DIM - start_idx - 2
+                
+                state_norm = norm_stats["state"]
+                sliced_norm = _transforms.NormStats(
+                    mean = state_norm.mean[..., :valid_action_dim],
+                    std = state_norm.std[..., :valid_action_dim],
+                    q01 = state_norm.q01[..., :valid_action_dim] if state_norm.q01 is not None else None,
+                    q99 = state_norm.q99[..., :valid_action_dim] if state_norm.q99 is not None else None,
+                )
+                logging.info(f"padding state norm states from {sliced_norm.mean.shape} to {norm_stats['state'].mean.shape} ")
+                norm_stats["state"] = sliced_norm
+                base_data_config = dataclasses.replace(base_data_config, norm_stats = norm_stats)
+        
+        
+        data_transforms = _transforms.Group(
+            inputs=[
+                rby1_policy.Rby1Inputs(
+                    action_dim = model_config.action_dim,
+                    exclude_torso=self.exclude_torso,
+                    use_cam_high_right = self.use_cam_high_right,
+                    exclude_gripper_from_state = self.exclude_gripper_from_state,
+                ),
+            ],
+            outputs=[
+                rby1_policy.Rby1Outputs(exclude_torso=self.exclude_torso),
+            ]
+        )
+        
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(16 if self.exclude_torso else 22)
+            data_transforms = data_transforms.push(
+                inputs = [_transforms.DeltaActions(delta_action_mask)],
+                outputs = [_transforms.AbsoluteActions(delta_action_mask)],
+            )
+        
+        model_transforms = ModelTransformFactory(default_prompt = self.default_prompt)(model_config)
+        
+        if model_config.remove_pad:
+            if model_config.remove_pad:
+                resize_idx = next(
+                    i for i, t in enumerate(model_transforms.inputs) if isinstance(t, _transforms.ResizeImages)
+                )
+                
+            resize_with_pad = model_transforms.inputs[resize_idx]
+            model_transforms.inputs[resize_idx] = _transforms.ResizeImagesWithoutPad(
+                width = resize_with_pad.width, height = resize_with_pad.height,
+            )
+        
+        return dataclasses.replace(
+            base_data_config,
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys = self.action_sequence_keys,
+        )
+
+@dataclasses.dataclass(frozen = True)
+class LeRobotRby1FTDataConfig(DataConfigFactory):
+    use_delta_joint_actions: bool = True
+    default_prompt: str | None = None
+    exclude_torso: bool = False
+    use_cam_high_right: bool = False
+    exclude_gripper_from_state: bool = False
+    use_quantile_norm: bool | None = None
+    ft_window_size: int | None = None
+    
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default = _transforms.Group(
+            inputs = [
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high_left":"observation.images.cam_high_left",
+                            "cam_high_right":"observation.images.cam_high_right",
+                            "cam_left_wrist":"observation.images.cam_left_wrist",
+                            "cam_right_wrist":"observation.images.cam_right_wrist"
+                        },
+                        "state":"observation.state",
+                        "ft_sensor":"observation.ft_sensor",
+                        "actions":"action",
+                        "prompt":"prompt"
+                    }
+                )
+            ]
+        )
+    )
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @staticmethod
+    def _alias_ft_window_norm_stats(
+        norm_stats: dict[str, _transforms.NormStats] | None,
+    ) -> dict[str, _transforms.NormStats] | None:
+        """Reuse single-frame F/T stats for temporal windows via broadcasting."""
+        if norm_stats is None or "ft_sensor_window" in norm_stats:
+            return norm_stats
+
+        for source_key in ("ft_sensor", "observation.ft_sensor"):
+            if source_key in norm_stats:
+                aliased_stats = dict(norm_stats)
+                aliased_stats["ft_sensor_window"] = norm_stats[source_key]
+                logging.info(
+                    "Aliased norm stats key `%s` -> `ft_sensor_window` for RBY1 F/T windows.",
+                    source_key,
+                )
+                return aliased_stats
+
+        return norm_stats
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        base_data_config = self.create_base_config(assets_dirs, model_config)
+        if self.use_quantile_norm is not None:
+            base_data_config = dataclasses.replace(
+                base_data_config,
+                use_quantile_norm = self.use_quantile_norm,
+            )
+        if self.exclude_gripper_from_state:
+            if base_data_config.norm_stats is not None and "state" in base_data_config.norm_stats:
+                norm_stats = base_data_config.norm_stats.copy()
+                start_idx = 6 if self.exclude_torso else 0
+                valid_action_dim = RBY1_ACTION_DIM - start_idx - 2
+                
+                state_norm = norm_stats["state"]
+                sliced_norm = _transforms.NormStats(
+                    mean = state_norm.mean[..., :valid_action_dim],
+                    std = state_norm.std[..., :valid_action_dim],
+                    q01 = state_norm.q01[..., :valid_action_dim] if state_norm.q01 is not None else None,
+                    q99 = state_norm.q99[..., :valid_action_dim] if state_norm.q99 is not None else None,
+                )
+                logging.info(f"padding state norm states from {sliced_norm.mean.shape} to {norm_stats['state'].mean.shape} ")
+                norm_stats["state"] = sliced_norm
+                base_data_config = dataclasses.replace(base_data_config, norm_stats = norm_stats)
+        
+        
+        data_transforms = _transforms.Group(
+            inputs=[
+                rby1_policy.Rby1Inputs(
+                    action_dim = model_config.action_dim,
+                    exclude_torso=self.exclude_torso,
+                    use_cam_high_right = self.use_cam_high_right,
+                    exclude_gripper_from_state = self.exclude_gripper_from_state,
+                ),
+            ],
+            outputs=[
+                rby1_policy.Rby1Outputs(exclude_torso=self.exclude_torso),
+            ]
+        )
+        
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(16 if self.exclude_torso else 22)
+            data_transforms = data_transforms.push(
+                inputs = [_transforms.DeltaActions(delta_action_mask)],
+                outputs = [_transforms.AbsoluteActions(delta_action_mask)],
+            )
+        
+        model_transforms = ModelTransformFactory(default_prompt = self.default_prompt)(model_config)
+        
+        if model_config.remove_pad:
+            if model_config.remove_pad:
+                resize_idx = next(
+                    i for i, t in enumerate(model_transforms.inputs) if isinstance(t, _transforms.ResizeImages)
+                )
+                
+            resize_with_pad = model_transforms.inputs[resize_idx]
+            model_transforms.inputs[resize_idx] = _transforms.ResizeImagesWithoutPad(
+                width = resize_with_pad.width, height = resize_with_pad.height,
+            )
+        
+        return dataclasses.replace(
+            base_data_config,
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys = self.action_sequence_keys,
+            ft_window_size=self.ft_window_size,
+            norm_stats=self._alias_ft_window_norm_stats(base_data_config.norm_stats),
+        )
 @dataclasses.dataclass(frozen=True)
 class LeRobotLiberoDataConfig(DataConfigFactory):
     """
@@ -582,6 +848,10 @@ class SideNetTrainConfig:
     # Enable/disable the two currently implemented injection routes.
     use_backbone_injector: bool = True
     use_expert_injector: bool = True
+    # If set, only the first `loss_action_dim` action dimensions contribute to
+    # the SideNet training loss while the model/action tensors remain at the
+    # full `model.action_dim`.
+    loss_action_dim: int | None = None
     # If non-empty, only these SideNet branches will remain trainable.
     trainable_branches: Sequence[str] = ()
     checkpoint: SideNetCheckpointConfig = dataclasses.field(default_factory=SideNetCheckpointConfig)
@@ -638,6 +908,8 @@ class TrainConfig:
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
+    val_interval: int = 10_000_000
+    enable_ema_torch: bool = False #QUESTION: what is ema?
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
@@ -690,6 +962,50 @@ _CONFIGS = [
     #
     # Inference Aloha configs.
     #
+    TrainConfig(
+        name='pi05_rby1_finetune',
+        exp_name="finetune",
+        model = pi0_config.Pi0Config(action_horizon=30, pi05=True, use_force=True),
+        # Uncomment and set these when running on the target server.
+        # assets_base_dir="/path/to/assets_root",
+        # checkpoint_base_dir="/path/to/checkpoint_root",
+        wandb_enabled=False,
+        data=LeRobotRby1FTDataConfig(
+            # repo_id="/path/to/rby1_lerobot_dataset",
+            default_prompt = "water hole insertion",
+            exclude_torso = True,
+            repack_transforms=_transforms.Group(
+                inputs = [
+                    _transforms.RepackTransform(
+                        {
+                            "images":{
+                                "cam_high_left":"observation.images.cam_high_left",
+                                "cam_high_right":"observation.images.cam_high_right",
+                                "cam_left_wrist":"observation.images.cam_left_wrist",
+                                "cam_right_wrist":"observation.images.cam_right_wrist",
+                            },
+                            "state":"observation.state",
+                            "ft_sensor":"observation.ft_sensor",
+                            "actions":"action"
+                        }
+                    )
+                ]
+            ),
+            # assets=AssetsConfig(
+            #     assets_dir="/path/to/assets_root",
+            #     asset_id="your_asset_id",
+            # ),
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("/path/to/pi05_base/params"),
+        num_train_steps=100_000,
+        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000, peak_lr=2e-4, decay_steps=50_000, decay_lr=2e-5
+        ),
+        batch_size=32,
+        num_workers=4,
+        fsdp_devices=8,
+    ),
     TrainConfig(
         name="pi0_aloha",
         model=pi0_config.Pi0Config(),
@@ -1133,34 +1449,85 @@ _CONFIGS = [
         num_train_steps=2,
         wandb_enabled=False,
     ),
+    TrainConfig(
+        name="debug_pi05_with_sidenet_jax_smoke",
+        data=FakeDataConfig(),
+        batch_size=1,
+        num_workers=0,
+        log_interval=1,
+        save_interval=1,
+        pytorch_training_precision="float32",
+        model=pi05_with_sidenet_jax.Pi05WithSideNetConfig(
+            pi05=True,
+            dtype="float32",
+            paligemma_variant="smoke_paligemma",
+            action_expert_variant="smoke_action_expert",
+            action_dim=32,
+            action_horizon=16,
+            sidenet_config_path="./sidenet/sidenet_smoke_config.yaml",
+        ),
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        overwrite=True,
+        exp_name="debug_pi05_with_sidenet_jax_smoke",
+        num_train_steps=2,
+        wandb_enabled=False,
+    ),
     #TODO: SideNet Configs
     TrainConfig(
         name="pi05_with_sidenet",
         model=pi0_config.Pi0Config(
             pi05=True,
+            use_force=True,
             action_dim=32,  # pi05 is trained with 32-dim actions
-            action_horizon=16,
+            action_horizon=30,
         ),
-        data=SamsungDataConfig(
-            repo_id="/robot_share/dataset/lerobot/water_hose_insertion/lerobot_260324_to_260325_water_hose_assembly_v3_rby1_410s",
+        # Uncomment and set these when running on the target server.
+        # assets_base_dir="/path/to/assets_root",
+        # checkpoint_base_dir="/path/to/checkpoint_root",
+        data=LeRobotRby1FTDataConfig(
+            # repo_id="/path/to/rby1_lerobot_dataset",
             default_prompt="Insert the right water hose into the hole",
-            ft_window_size=6,
+            exclude_torso=True,
+            # assets=AssetsConfig(
+            #     assets_dir="/path/to/assets_root",
+            #     asset_id="your_asset_id",
+            # ),
         ),
-        pytorch_weight_path="/robot_share/model/SR_pi05_base/Pi_05_Pretrain_Weights_200000",
+        # pytorch_weight_path="/path/to/base_pi05_checkpoint_dir",
         sidenet=SideNetTrainConfig(
             enabled=True,
             config_path="./sidenet/sidenet_config.yaml",
             train_pi05=False,
-            # FIX: modalities are now keyed by Observation.modalities / SideNet
-            # branch names instead of raw dataset keys.
-            modalities=("force_torque",),
+            modalities=("ft_sensor",),
             use_backbone_injector=True,
             use_expert_injector=True,
+            loss_action_dim=RBY1_ACTION_DIM - 6,
             checkpoint=SideNetCheckpointConfig(
                 save_base_pi05=False,
                 save_sidenet_full=True,
                 save_sidenet_branches=True,
             ),
+        ),
+        num_train_steps=20_000,
+    ),
+    TrainConfig(
+        name="pi05_with_sidenet_jax",
+        model=pi05_with_sidenet_jax.Pi05WithSideNetConfig(
+            pi05=True,
+            use_force=True,
+            action_dim=32,
+            action_horizon=30,
+            sidenet_config_path="./sidenet/sidenet_config.yaml",
+        ),
+        data=LeRobotRby1FTDataConfig(
+            default_prompt="Insert the right water hose into the hole",
+            exclude_torso=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        sidenet=SideNetTrainConfig(
+            enabled=False,
+            config_path="./sidenet/sidenet_config.yaml",
+            modalities=("ft_sensor",),
         ),
         num_train_steps=20_000,
     ),
