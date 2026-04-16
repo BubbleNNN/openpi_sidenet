@@ -42,6 +42,12 @@ the `ft_sensor` branch with `input_dim: 12`.
 
 ## Training
 
+Wrapper-friendly base checkpoint loading is implemented in
+`sidenet/jax/weight_loader.py`.
+Unlike the generic OpenPI loader, it keeps any missing SideNet parameters at
+their initialized values instead of requiring the checkpoint to contain the
+full wrapper tree.
+
 If you need fresh normalization statistics:
 
 ```bash
@@ -75,6 +81,9 @@ uv run scripts/serve_policy.py policy:checkpoint \
 ## Notes
 
 - The wrapper is loaded through the normal JAX `TrainConfig.model.create/load` path.
+- Training checkpoints still save the full JAX parameter tree through the
+  standard Orbax path, and additionally snapshot `sidenet_config.yaml` plus a
+  small manifest under `assets/sidenet_jax/`.
 - `sidenet.enabled` is left `False` for the JAX config so inference does not get
   misrouted into the PyTorch split-SideNet loading branch.
 - If you want to change the SideNet architecture, update the YAML file and keep

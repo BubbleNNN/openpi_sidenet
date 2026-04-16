@@ -34,6 +34,7 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
 import sidenet.jax.pi05_with_sidenet as pi05_with_sidenet_jax
+import sidenet.jax.weight_loader as sidenet_jax_weight_loader
 
 from openpi.policies.rby1_policy import RBY1_ACTION_DIM
 
@@ -1523,7 +1524,10 @@ _CONFIGS = [
             default_prompt="Insert the right water hose into the hole",
             exclude_torso=True,
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=sidenet_jax_weight_loader.PartialCheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            log_prefix="pi05_with_sidenet_jax",
+        ),
         sidenet=SideNetTrainConfig(
             enabled=False,
             config_path="./sidenet/sidenet_config.yaml",

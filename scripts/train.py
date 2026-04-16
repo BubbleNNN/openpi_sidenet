@@ -27,6 +27,7 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+import sidenet.jax.checkpointing as sidenet_jax_checkpointing
 try:
     from tensorboardX import SummaryWriter
     _TENSORBOARD_AVAILABLE = True
@@ -267,6 +268,9 @@ def main(config: _config.TrainConfig):
         sharding=data_sharding,
         shuffle=True,
     )
+    extra_asset_callbacks = []
+    if (callback := sidenet_jax_checkpointing.maybe_get_asset_callback(config.model)) is not None:
+        extra_asset_callbacks.append(callback)
     data_iter = iter(data_loader)
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
@@ -327,7 +331,13 @@ def main(config: _config.TrainConfig):
         # print(f)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            _checkpoints.save_state(
+                checkpoint_manager,
+                train_state,
+                data_loader,
+                step,
+                extra_asset_callbacks=extra_asset_callbacks,
+            )
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

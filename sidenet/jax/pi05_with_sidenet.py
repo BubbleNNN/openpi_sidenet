@@ -18,6 +18,7 @@ from flax import nnx
 import flax.nnx.bridge as nnx_bridge
 import jax
 import jax.numpy as jnp
+import orbax.checkpoint as ocp
 from typing_extensions import override
 
 from openpi.models import model as _model
@@ -26,6 +27,7 @@ from openpi.models import pi0_config
 from openpi.shared import array_typing as at
 
 from sidenet.jax.sidenet import SideNet
+from sidenet.jax import weight_loader as sidenet_weight_loader
 from sidenet.parse_config import load_sidenet_config
 
 
@@ -45,6 +47,22 @@ class Pi05WithSideNetConfig(pi0_config.Pi0Config):
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi05WithSideNet":
         return Pi05WithSideNet(self, rngs=nnx.Rngs(rng))
+
+    @override
+    def load(self, params: at.Params, *, remove_extra_params: bool = True) -> "Pi05WithSideNet":
+        model = nnx.eval_shape(self.create, jax.random.key(0))
+        graphdef, state = nnx.split(model)
+        reference_params = state.to_pure_dict()
+        if remove_extra_params:
+            params = ocp.transform_utils.intersect_trees(reference_params, params)
+        params = sidenet_weight_loader.merge_loaded_params(
+            params,
+            reference_params,
+            log_prefix="pi05_with_sidenet_jax.load",
+        )
+        at.check_pytree_equality(expected=reference_params, got=params, check_shapes=True, check_dtypes=False)
+        state.replace_by_pure_dict(params)
+        return nnx.merge(graphdef, state)
 
     @override
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
