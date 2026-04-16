@@ -73,6 +73,8 @@ class Pi05WithSideNet(_model.BaseModel):
                 branch_input_dims=(("ft_sensor", config.ft_sensor_dim),),
                 d_model=sidenet_cfg.d_model,
                 num_perceiver_queries=sidenet_cfg.num_perceiver_queries,
+                num_input_tokens=sidenet_cfg.num_input_tokens,
+                num_perceiver_layers=sidenet_cfg.num_perceiver_layers,
                 num_fusion_queries=sidenet_cfg.num_fusion_queries,
                 num_heads=sidenet_cfg.num_heads,
                 text_embed_dim=sidenet_cfg.text_embed_dim,

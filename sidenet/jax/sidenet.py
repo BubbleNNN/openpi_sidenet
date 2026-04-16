@@ -55,6 +55,8 @@ class SideNet(nn.Module):
     num_perceiver_queries: int = 8
     num_fusion_queries: int = 8
     num_heads: int = 8
+    num_input_tokens: int = 4
+    num_perceiver_layers: int = 2
     text_embed_dim: int = 2048
     output_hidden_features: int = 1024
     output_dim: int = 1024
@@ -65,6 +67,8 @@ class SideNet(nn.Module):
                 input_dim=input_dim,
                 d_model=self.d_model,
                 num_queries=self.num_perceiver_queries,
+                num_input_tokens=self.num_input_tokens,
+                num_layers=self.num_perceiver_layers,
                 num_heads=self.num_heads,
                 name=f"branch_{name}",
             )
@@ -164,6 +168,8 @@ class SideNet(nn.Module):
             branch_input_dims=branch_input_dims,
             d_model=overrides.get("d_model", cfg.d_model),
             num_perceiver_queries=overrides.get("num_perceiver_queries", cfg.num_perceiver_queries),
+            num_input_tokens=overrides.get("num_input_tokens", cfg.num_input_tokens),
+            num_perceiver_layers=overrides.get("num_perceiver_layers", cfg.num_perceiver_layers),
             num_fusion_queries=overrides.get("num_fusion_queries", cfg.num_fusion_queries),
             num_heads=overrides.get("num_heads", cfg.num_heads),
             text_embed_dim=overrides.get("text_embed_dim", cfg.text_embed_dim),

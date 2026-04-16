@@ -2,8 +2,9 @@
 Parse the SideNet v2 YAML config into typed Python objects.
 
 The v2 config is flat and describes the perceiver-based architecture:
-    d_model, num_perceiver_queries, num_fusion_queries, num_heads,
-    text_embed_dim, branches (each with input_dim), output_mlp.
+    d_model, num_perceiver_queries, num_perceiver_layers, num_input_tokens,
+    num_fusion_queries, num_heads, text_embed_dim, branches
+    (each with input_dim), output_mlp.
 """
 
 from __future__ import annotations
@@ -25,6 +26,8 @@ class SideNetConfig:
     """Top-level SideNet v2 configuration."""
     d_model: int
     num_perceiver_queries: int
+    num_perceiver_layers: int
+    num_input_tokens: int
     num_fusion_queries: int
     num_heads: int
     text_embed_dim: int
@@ -71,6 +74,8 @@ def load_sidenet_config(config_path: str) -> SideNetConfig:
     return SideNetConfig(
         d_model=int(raw["d_model"]),
         num_perceiver_queries=int(raw["num_perceiver_queries"]),
+        num_perceiver_layers=int(raw.get("num_perceiver_layers", 2)),
+        num_input_tokens=int(raw.get("num_input_tokens", 4)),
         num_fusion_queries=int(raw["num_fusion_queries"]),
         num_heads=int(raw["num_heads"]),
         text_embed_dim=int(raw["text_embed_dim"]),

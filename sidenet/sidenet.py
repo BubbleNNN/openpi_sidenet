@@ -53,6 +53,8 @@ class SideNet(nn.Module):
                     input_dim=branch_cfg.input_dim,
                     d_model=d_model,
                     num_queries=self.config.num_perceiver_queries,
+                    num_input_tokens=self.config.num_input_tokens,
+                    num_layers=self.config.num_perceiver_layers,
                     num_heads=num_heads,
                 )
                 for name, branch_cfg in self.config.branches.items()

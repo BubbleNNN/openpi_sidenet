@@ -9,6 +9,13 @@ d_model: 512
 # Number of learnable query tokens per perceiver encoder branch.
 num_perceiver_queries: 8
 
+# Number of latent refinement blocks in each perceiver branch.
+num_perceiver_layers: 2
+
+# Single-frame ft_sensor is first expanded into this many sensor tokens
+# before the latent queries cross-attend to it.
+num_input_tokens: 4
+
 # Number of learnable fusion query tokens in the
 # text-conditioned cross-attention stage.
 num_fusion_queries: 8

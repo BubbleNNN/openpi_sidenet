@@ -4,6 +4,8 @@
 
 d_model: 128
 num_perceiver_queries: 4
+num_perceiver_layers: 2
+num_input_tokens: 4
 num_fusion_queries: 4
 num_heads: 4
 text_embed_dim: 2048

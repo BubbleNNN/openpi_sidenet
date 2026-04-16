@@ -22,27 +22,58 @@ class PerceiverEncoder(nn.Module):
         d_model: int,
         num_queries: int,
         num_heads: int,
+        num_input_tokens: int = 4,
+        num_layers: int = 2,
         dropout: float = 0.0,
         layer_norm_eps: float = 1e-5,
     ):
         super().__init__()
+        if num_input_tokens <= 0:
+            raise ValueError(f"num_input_tokens must be positive, got {num_input_tokens}")
+        if num_layers <= 0:
+            raise ValueError(f"num_layers must be positive, got {num_layers}")
+
         self.input_proj = nn.Linear(input_dim, d_model)
+        self.num_input_tokens = num_input_tokens
+        self.num_layers = num_layers
+        self.single_frame_tokenizer = nn.Sequential(
+            nn.Linear(input_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, num_input_tokens * d_model),
+        )
         self.latent_queries = nn.Parameter(
             torch.randn(1, num_queries, d_model) * 0.02
         )
-
-        self.norm_q = nn.LayerNorm(d_model, eps=layer_norm_eps)
-        self.norm_kv = nn.LayerNorm(d_model, eps=layer_norm_eps)
-        self.cross_attn = nn.MultiheadAttention(
-            d_model, num_heads, dropout=dropout, batch_first=True,
-        )
-
-        self.norm_ffn = nn.LayerNorm(d_model, eps=layer_norm_eps)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 4, d_model),
+        self.blocks = nn.ModuleList(
+            [
+                nn.ModuleDict(
+                    {
+                        "norm_cross_q": nn.LayerNorm(d_model, eps=layer_norm_eps),
+                        "norm_cross_kv": nn.LayerNorm(d_model, eps=layer_norm_eps),
+                        "cross_attn": nn.MultiheadAttention(
+                            d_model,
+                            num_heads,
+                            dropout=dropout,
+                            batch_first=True,
+                        ),
+                        "norm_self": nn.LayerNorm(d_model, eps=layer_norm_eps),
+                        "self_attn": nn.MultiheadAttention(
+                            d_model,
+                            num_heads,
+                            dropout=dropout,
+                            batch_first=True,
+                        ),
+                        "norm_ffn": nn.LayerNorm(d_model, eps=layer_norm_eps),
+                        "ffn": nn.Sequential(
+                            nn.Linear(d_model, d_model * 4),
+                            nn.GELU(),
+                            nn.Dropout(dropout),
+                            nn.Linear(d_model * 4, d_model),
+                        ),
+                    }
+                )
+                for _ in range(num_layers)
+            ]
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -59,17 +90,30 @@ class PerceiverEncoder(nn.Module):
         # Align dtype / device to the projection layer.
         x = x.to(device=self.input_proj.weight.device, dtype=self.input_proj.weight.dtype)
 
-        kv = self.input_proj(x)  # (B, T, d_model)
+        if x.shape[1] == 1:
+            kv = self.single_frame_tokenizer(x[:, 0])
+            kv = kv.view(x.shape[0], self.num_input_tokens, self.input_proj.out_features)
+        else:
+            kv = self.input_proj(x)  # (B, T, d_model)
 
         B = kv.shape[0]
-        queries = self.latent_queries.expand(B, -1, -1)  # (B, num_queries, d_model)
+        latents = self.latent_queries.expand(B, -1, -1)  # (B, num_queries, d_model)
 
-        # Cross-attention: Q = learnable queries, K/V = projected input
-        q = self.norm_q(queries)
-        kv_normed = self.norm_kv(kv)
-        attn_out, _ = self.cross_attn(q, kv_normed, kv_normed, need_weights=False)
-        out = queries + attn_out
+        for block in self.blocks:
+            kv_normed = block["norm_cross_kv"](kv)
+            q = block["norm_cross_q"](latents)
+            attn_out, _ = block["cross_attn"](q, kv_normed, kv_normed, need_weights=False)
+            latents = latents + attn_out
 
-        # FFN
-        out = out + self.ffn(self.norm_ffn(out))
-        return out
+            latent_normed = block["norm_self"](latents)
+            self_attn_out, _ = block["self_attn"](
+                latent_normed,
+                latent_normed,
+                latent_normed,
+                need_weights=False,
+            )
+            latents = latents + self_attn_out
+
+            latents = latents + block["ffn"](block["norm_ffn"](latents))
+
+        return latents
