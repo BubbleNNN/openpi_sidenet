@@ -119,12 +119,9 @@ class Pi05WithSideNet(_model.BaseModel):
 
     def _resolve_ft_sensor(self, observation: _model.Observation) -> jnp.ndarray:
         ft_sensor = observation.ft_sensor
-        if ft_sensor is None and observation.modalities is not None:
-            ft_sensor = observation.modalities.get("ft_sensor")
         if ft_sensor is None:
             raise ValueError(
-                "Pi05WithSideNet requires `observation.ft_sensor` "
-                "or `observation.modalities[\"ft_sensor\"]`."
+                "Pi05WithSideNet requires `observation.ft_sensor`."
             )
 
         ft_sensor = jnp.asarray(ft_sensor, dtype=jnp.float32)

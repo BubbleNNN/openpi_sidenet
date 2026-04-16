@@ -18,6 +18,7 @@ and injects SideNet output tokens into the suffix/action-expert path.
 
 - Only `pi05=True` is supported.
 - Only single-frame `ft_sensor` is supported.
+- The wrapper expects `observation.ft_sensor` directly.
 - Accepted `ft_sensor` shapes are `(B, 12)` and `(B, 1, 12)`.
 - Multi-frame F/T windows are intentionally rejected.
 - Text conditioning comes from contextualized VLM prefix hidden states, not raw token embeddings.
