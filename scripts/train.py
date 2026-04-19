@@ -21,6 +21,7 @@ import openpi.models.model as _model
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
+import openpi.training.checker as _checker
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.training.optimizer as _optimizer
@@ -275,6 +276,12 @@ def main(config: _config.TrainConfig):
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
+    train_checker = None
+    if config.training_checker.enabled:
+        checker_dir = config.checkpoint_dir / config.training_checker.output_subdir
+        train_checker = _checker.TrainingChecker(config.training_checker, checker_dir)
+        logging.info("Training checker enabled; reports will be written to %s", checker_dir)
+
     # Log images from first batch to sanity check.
     images_to_log = [
         wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
@@ -319,6 +326,18 @@ def main(config: _config.TrainConfig):
             wandb.log(reduced_info, step=step)
             tb_logger.log(step, reduced_info)
             infos = []
+
+        if train_checker is not None and train_checker.should_run(step):
+            try:
+                with sharding.set_mesh(mesh):
+                    checker_report = train_checker.run(config, train_rng, train_state, batch)
+                train_checker.write(step, checker_report)
+                checker_scalars = train_checker.summarize_scalars(checker_report)
+                if checker_scalars:
+                    wandb.log(checker_scalars, step=step)
+                    tb_logger.log(step, checker_scalars)
+            except Exception:
+                logging.exception("Training checker failed at step %d", step)
         batch = next(data_iter)
         # # 添加以下代码来查看第一个batch的统计信息
         # observation, actions = batch

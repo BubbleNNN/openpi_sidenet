@@ -31,6 +31,7 @@ import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
+import openpi.training.checker as training_checker
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
 import sidenet.jax.pi05_with_sidenet as pi05_with_sidenet_jax
@@ -930,6 +931,11 @@ class TrainConfig:
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
 
+    # Optional opt-in training checker for debugging unstable optimization.
+    training_checker: training_checker.TrainingCheckerConfig = dataclasses.field(
+        default_factory=training_checker.TrainingCheckerConfig
+    )
+
     # If the value is greater than 1, FSDP will be enabled and shard across number of specified devices; overall
     # device memory will be reduced but training could potentially be slower.
     # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
@@ -1473,6 +1479,41 @@ _CONFIGS = [
         num_train_steps=2,
         wandb_enabled=False,
     ),
+    TrainConfig(
+        name="debug_pi05_with_sidenet_jax_smoke_checker",
+        data=FakeDataConfig(),
+        batch_size=1,
+        num_workers=0,
+        log_interval=1,
+        save_interval=1,
+        pytorch_training_precision="float32",
+        model=pi05_with_sidenet_jax.Pi05WithSideNetConfig(
+            pi05=True,
+            dtype="float32",
+            paligemma_variant="smoke_paligemma",
+            action_expert_variant="smoke_action_expert",
+            action_dim=32,
+            action_horizon=16,
+            sidenet_config_path="./sidenet/sidenet_smoke_config.yaml",
+        ),
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        training_checker=training_checker.TrainingCheckerConfig(
+            enabled=True,
+            interval=1,
+            initial_consecutive_steps=2,
+            max_per_sample=1,
+            max_leaf_paths=16,
+            max_component_paths=8,
+            compute_component_ablation=True,
+            compute_component_scale_gradients=True,
+            compute_per_sample_gradients=True,
+            log_full_per_sample_losses=True,
+        ),
+        overwrite=True,
+        exp_name="debug_pi05_with_sidenet_jax_smoke_checker",
+        num_train_steps=2,
+        wandb_enabled=False,
+    ),
     #TODO: SideNet Configs
     TrainConfig(
         name="pi05_with_sidenet",
@@ -1527,6 +1568,43 @@ _CONFIGS = [
         weight_loader=sidenet_jax_weight_loader.PartialCheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_base/params",
             log_prefix="pi05_with_sidenet_jax",
+        ),
+        sidenet=SideNetTrainConfig(
+            enabled=False,
+            config_path="./sidenet/sidenet_config.yaml",
+            modalities=("ft_sensor",),
+        ),
+        num_train_steps=20_000,
+    ),
+    TrainConfig(
+        name="pi05_with_sidenet_jax_checker",
+        model=pi05_with_sidenet_jax.Pi05WithSideNetConfig(
+            pi05=True,
+            use_force=True,
+            action_dim=32,
+            action_horizon=30,
+            sidenet_config_path="./sidenet/sidenet_config.yaml",
+        ),
+        data=LeRobotRby1FTDataConfig(
+            default_prompt="Insert the right water hose into the hole",
+            exclude_torso=True,
+        ),
+        weight_loader=sidenet_jax_weight_loader.PartialCheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            log_prefix="pi05_with_sidenet_jax_checker",
+        ),
+        training_checker=training_checker.TrainingCheckerConfig(
+            enabled=True,
+            interval=50,
+            initial_consecutive_steps=10,
+            output_subdir="training_checker",
+            max_per_sample=8,
+            max_leaf_paths=32,
+            max_component_paths=16,
+            compute_component_ablation=True,
+            compute_component_scale_gradients=True,
+            compute_per_sample_gradients=True,
+            log_full_per_sample_losses=True,
         ),
         sidenet=SideNetTrainConfig(
             enabled=False,
