@@ -37,6 +37,18 @@ class CNNEncoder(nn.Module):
 
     def forward(self, x):
         # x shape: (batch_size, time_steps, sensor_dim)
+        # RBY1 F/T often arrives as a single frame `(batch_size, sensor_dim)`;
+        # lift it to a length-1 sequence so the temporal conv path stays valid.
+        if x.ndim == 2:
+            x = x[:, None, :]
+        elif x.ndim != 3:
+            raise ValueError(
+                f"CNNEncoder expects a 2D single-frame tensor or 3D temporal tensor, got shape {tuple(x.shape)}"
+            )
+
+        # FIX: align sensor inputs to the conv stack precision/device so raw
+        # float64 batches from the data pipeline do not trip Conv1d dtype checks.
+        x = x.to(device=self.conv1.weight.device, dtype=self.conv1.weight.dtype)
         x = x.transpose(1, 2)  # (batch_size, sensor_dim, time_steps)
         x = self.conv1(x)  # (batch_size, mid_channels, time_steps)
         if self.norm is not None:

@@ -166,8 +166,16 @@ def preprocess_observation_pytorch(
         images=out_images,
         image_masks=out_masks,
         state=observation.state,
+        tactile_sensor = observation.tactile_sensor,
+        ft_sensor = observation.ft_sensor,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
+        prefix_tokenized_prompt=observation.prefix_tokenized_prompt
+        if hasattr(observation, 'prefix_tokenized_prompt')
+        else None,
+        prefix_tokenized_prompt_mask=observation.prefix_tokenized_prompt_mask
+        if hasattr(observation, 'prefix_tokenized_prompt_mask')
+        else None,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
     )

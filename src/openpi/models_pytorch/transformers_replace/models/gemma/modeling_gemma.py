@@ -252,7 +252,44 @@ def eager_attention_forward(
 
     return attn_output, attn_weights
 
+def eager_ki_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    q_masks: torch.Tensor,
+    k_masks: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs,
+):
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
+    
+    logits_nosg = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    logits_sg = torch.matmul(q_masks, k_masks.transpose(2, 3).detach()) * scaling
 
+    q_is_action = q_masks[:,:,None,None]
+    k_is_backbone = k_masks[:,None,:,None]
+    sg_mask = (q_is_action & k_is_backbone)
+    sg_mask = torch.permute(sg_mask, (0,3,1,2)) 
+    
+    logits = torch.where(sg_mask, logits_sg, logits_nosg)   
+
+    if attention_mask is not None:
+        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        logits = logits + causal_mask
+
+    attn_weights = nn.functional.softmax(logits, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output_nosg = torch.matmul(torch.where(sg_mask,0.,attn_weights), value_states)
+    attn_output_sg = torch.matmul(torch.where(sg_mask,attn_weights,0.), value_states.detach())
+    attn_output = attn_output_nosg + attn_output_sg
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    return attn_output, attn_weights
+    
 class GemmaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 

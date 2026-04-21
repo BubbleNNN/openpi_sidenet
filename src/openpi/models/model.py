@@ -33,6 +33,7 @@ class ModelType(enum.Enum):
     PI0 = "pi0"
     PI0_FAST = "pi0_fast"
     PI05 = "pi05"
+    PI05_KI = "pi05_ki"
 
 
 # The model always expects these images
@@ -93,12 +94,17 @@ class Observation(Generic[ArrayT]):
     image_masks: dict[str, at.Bool[ArrayT, "*b"]]
     # Low-dimensional robot state.
     state: at.Float[ArrayT, "*b s"]
+    
+    tactile_sensor: at.Float[ArrayT, "*b t"] | None = None
+    ft_sensor: at.Float[ArrayT, "*b f"] | None = None
 
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
     # Tokenized prompt mask.
     tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    prefix_tokenized_prompt: at.Int[ArrayT, "*b ll"] | None = None
+    prefix_tokenized_prompt_mask: at.Bool[ArrayT, "*b ll"] | None = None
     # pi0-fast model specific fields.
 
     # Token auto-regressive mask (for FAST autoregressive model).
@@ -134,23 +140,28 @@ class Observation(Generic[ArrayT]):
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
                 data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
-            elif isinstance(data["image"][key], torch.Tensor):
-                # FIX: normalize PyTorch image tensors onto the BCHW convention
-                # expected by the PyTorch pi0/pi05 path, even when they arrive
-                # as float BHWC tensors from fake/debug data.
-                image = data["image"][key]
-                if image.dtype == torch.uint8:
-                    image = image.to(torch.float32) / 255.0 * 2.0 - 1.0
-                if image.ndim >= 4 and image.shape[-1] == 3 and image.shape[1] != 3:
-                    image = image.permute(0, 3, 1, 2)
-                data["image"][key] = image
+            elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
+                data["image"][key] = data["image"][key].to(torch.float32).permute(0,3,1,2) / 255.0 * 2.0 - 1.0
+                
+        if "tactile_sensor" in data and data["tactile_sensor"] is not None:
+            tactile = data["tactile_sensor"]
+            if hasattr(tactile, "dtype") and tactile.dtype == np.uint8:
+                data["tactile_sensor"] = tactile.astype(np.float32) / 255.0 * 2.0 - 1.0
+            elif hasattr(tactile, "dtype") and tactile.dtype == torch.uint8 or (
+                hasattr(tactile, "dtype") and tactile.dtype == torch.int64
+            ):
+                data["tactile_sensor"] = tactile.to(torch.float32) / 255.0 * 2.0 - 1.0
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
             state=data["state"],
+            tactile_sensor=data.get("tactile_sensor"),
+            ft_sensor=data.get("ft_sensor"),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
+            prefix_tokenized_prompt=data.get("prefix_tokenized_prompt"),
+            prefix_tokenized_prompt_mask=data.get("prefix_tokenized_prompt_mask"),
             token_loss_mask=data.get("token_loss_mask"),
             modalities=modalities,
         )
@@ -231,6 +242,10 @@ def preprocess_observation(
         images=out_images,
         image_masks=out_masks,
         state=observation.state,
+        tactile_sensor=observation.tactile_sensor,
+        ft_sensor=observation.ft_sensor,
+        prefix_tokenized_prompt=observation.prefix_tokenized_prompt,
+        prefix_tokenized_prompt_mask=observation.prefix_tokenized_prompt_mask,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
@@ -251,6 +266,8 @@ class BaseModelConfig(abc.ABC):
     action_horizon: int
     # Tokenized prompt maximum length.
     max_token_len: int
+    
+    remove_pad : bool = True
 
     @property
     @abc.abstractmethod
@@ -273,7 +290,12 @@ class BaseModelConfig(abc.ABC):
 
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
-        model = pi0_pytorch.PI0Pytorch(config=train_config.model)
+        if train_config.model.use_force:
+            model = pi0_pytorch.PI0ForcePytorch(config=train_config.model)
+        elif train_config.model.use_tactile:
+            model = pi0_pytorch.PI0TactilePytorch(config=train_config.model)
+        else:
+            model = pi0_pytorch.PI0Pytorch(config=train_config.model)
         safetensors.torch.load_model(model, weight_path)
         return model
 

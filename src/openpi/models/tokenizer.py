@@ -33,13 +33,18 @@ class PaligemmaTokenizer:
         with path.open("rb") as f:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
-    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    def tokenize(self, prompt: str, state: np.ndarray | None = None, force: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
         cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
         if state is not None:
             # This is the Pi05 format, where the state is part of the discrete language input.
             discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
             state_str = " ".join(map(str, discretized_state))
-            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+            if force is not None:
+                discretized_force = np.digitize(force, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+                force_str = " ".join(map(str, discretized_force))
+                full_prompt = f"Task: {cleaned_text}, State: {state_str}, Force: {force_str};\nAction: "
+            else:
+                full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
             tokens = self._tokenizer.encode(full_prompt, add_bos=True)
         else:
             # This is the Pi0 format, where the state is part of the continuous action expert input.
@@ -60,8 +65,91 @@ class PaligemmaTokenizer:
             mask = [True] * self._max_len
 
         return np.asarray(tokens), np.asarray(mask)
+class PaligemmaFASTTokenizer:
+    def __init__(self, max_len:int = 48, fast_tokenizer_path: str = "physical-intelligence/fast"):
+        self._prefix_max_len = 220
+        self._max_len = max_len
 
+        path = _maybe_download_paligemma_tokenizer()
+        with path.open("rb") as f:
+            self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
+        self._fast_tokenizer = AutoProcessor.from_pretrained(fast_tokenizer_path, trust_remote_code=True)
+        self._fast_skip_tokens = 128  # Skip last 128 tokens in PaliGemma vocab since they are special tokens
+    def tokenize(
+        self, prompt: str, state: np.ndarray, actions: np.ndarray | None
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        cleaned_text = prompt.lower().strip().replace("_", " ").replace("\n", " ")
+
+        # Convention: state gets discretized into 256 discrete bins (assumed range after normalization: [-1, 1])
+        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+
+        # Convention: prefix includes prompt and string-representation of state, followed by ';'
+        state_str = " ".join(map(str, discretized_state))
+        full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+        prefix_tokens = self._tokenizer.encode(full_prompt, add_bos=True)
+        
+
+        if actions is not None:
+            # Tokenize actions with FAST tokenizer --> map to last
+            action_tokens = self._fast_tokenizer(actions[None])[0]
+            action_tokens_in_pg = self._act_tokens_to_paligemma_tokens(action_tokens)
+            postfix_tokens = action_tokens_in_pg.tolist() + self._tokenizer.encode("|", add_eos=True)
+        else:
+            postfix_tokens = []
+            
+        tokens = postfix_tokens
+        token_mask = [True] * len(tokens)
+        ar_mask = [1] * len(postfix_tokens)
+        loss_mask = [True] * len(postfix_tokens)
+        
+        prefix_tokens_len = len(prefix_tokens)
+        if prefix_tokens_len < self._prefix_max_len:
+            padding = [False] * (self._prefix_max_len - prefix_tokens_len)
+            prefix_mask = [True] * (prefix_tokens_len) + padding
+            prefix_tokens = prefix_tokens + padding
+        else:
+            if len(prefix_tokens) > self._prefix_max_len:
+                logging.warning(
+                    f"Prefix token length ({len(prefix_tokens)}) exceeds max length ({self._prefix_max_len}), truncating. "
+                )
+            prefix_tokens = prefix_tokens[: self._prefix_max_len]
+            prefix_mask = [True] * self._prefix_max_len
+        
+        tokens_len = len(tokens)
+        if tokens_len < self._max_len:
+            padding = [False] * (self._max_len - tokens_len)
+            tokens = tokens+padding
+            token_mask = token_mask + padding
+            ar_mask = ar_mask + padding
+            loss_mask = loss_mask + padding
+        else:
+            if len(tokens) > self._max_len:
+                logging.warning(
+                    f"Token length ({len(tokens)}) exceeds max length ({self._max_len}), truncating. "
+                    "Consider increasing the `max_token_len` in your model config if this happens frequently."
+                )
+            tokens = tokens[: self._max_len]
+            token_mask = token_mask[: self._max_len]
+            ar_mask = ar_mask[: self._max_len]
+            loss_mask = loss_mask[: self._max_len]
+        return (
+            np.asarray(prefix_tokens),
+            np.asarray(prefix_mask),
+            np.asarray(tokens),
+            np.asarray(token_mask),
+            np.asarray(ar_mask),
+            np.asarray(loss_mask),
+        )
+    def _act_tokens_to_paligemma_tokens(self, tokens: np.ndarray | list[int]) -> np.ndarray:
+        if isinstance(tokens, list):
+            tokens = np.array(tokens)
+        return self._tokenizer.vocab_size() - 1 - self._fast_skip_tokens - 32-1024-tokens
+    def detokenize(self, tokens: np.ndarray) -> str:
+        non_padding_tokens = tokens[tokens != False]
+        return self._tokenizer.decode(non_padding_tokens.tolist())
+        
+            
 class FASTTokenizer:
     def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
         self._max_len = max_len

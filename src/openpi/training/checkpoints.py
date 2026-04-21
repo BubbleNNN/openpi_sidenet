@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures as futures
 import dataclasses
 import logging
+from collections.abc import Sequence
 from typing import Protocol
 
 from etils import epath
@@ -67,6 +68,8 @@ def save_state(
     state: training_utils.TrainState,
     data_loader: _data_loader.DataLoader,
     step: int,
+    *,
+    extra_asset_callbacks: Sequence[Callback] = (),
 ):
     def save_assets(directory: epath.Path):
         # Save the normalization stats.
@@ -74,6 +77,8 @@ def save_state(
         norm_stats = data_config.norm_stats
         if norm_stats is not None and data_config.asset_id is not None:
             _normalize.save(directory / data_config.asset_id, norm_stats)
+        for callback in extra_asset_callbacks:
+            callback(directory)
 
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():

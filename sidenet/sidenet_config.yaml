@@ -1,39 +1,40 @@
+# ---------------------------------------------------------
+# SideNet v2 config — perceiver-based architecture
+# ---------------------------------------------------------
+
+# Internal feature dimension shared by all perceiver encoders,
+# the concat self-attention, and the text-conditioned cross-attention.
+d_model: 512
+
+# Number of learnable query tokens per perceiver encoder branch.
+num_perceiver_queries: 8
+
+# Number of latent refinement blocks in each perceiver branch.
+num_perceiver_layers: 2
+
+# Single-frame ft_sensor is first expanded into this many sensor tokens
+# before the latent queries cross-attend to it.
+num_input_tokens: 4
+
+# Number of learnable fusion query tokens in the
+# text-conditioned cross-attention stage.
+num_fusion_queries: 8
+
+# Attention head count for all attention modules.
+num_heads: 8
+
+# Dimension of the VLA backbone's token embeddings (PaliGemma = 2048).
+text_embed_dim: 2048
+
+# Per-modality branches. Each branch only needs its raw input dimension;
+# the perceiver encoder handles projection to d_model internally.
+# Current JAX wrapper wires only single-frame `ft_sensor` with shape (B, 12).
 branches:
-  force_torque:
-    encoder:
-      type: cnn_encoder
-      params:
-        in_channels: 12
-        mid_channels: 64
-        out_channels: 128
-    projector:
-      type: mlp_projector
-      params:
-        in_features: 128
-        hidden_features: 256
-        out_features: 512
-    refiner:
-      type: attn_refiner
-      params:
-        in_features: 512
-        num_heads: 4
-fusion:
-  type: crossattn_fusion
-  params:
-    in_features: 512
-    num_heads: 4
-injector:
-  backbone:
-    position: cross_attention
-    type: mlp_injector
-    params:
-      in_features: 512
-      hidden_features: 1024
-      out_features: 2048
-  expert:
-    position: adarmsnorm
-    type: mlp_injector
-    params:
-      in_features: 512
-      hidden_features: 1024
-      out_features: 1024
+  ft_sensor:
+    input_dim: 12
+
+# Zero-init output MLP that maps d_model → action-expert hidden width.
+output_mlp:
+  hidden_features: 1024
+  # Must match the action-expert hidden size (gemma_300m width = 1024).
+  out_features: 1024

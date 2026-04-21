@@ -96,10 +96,12 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
+        ki: bool = False,
+        vlm_training: bool | None = False
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
-        if inputs_embeds[1] is None:
+        if inputs_embeds[1] is None and vlm_training == False:
             prefix_output = self.paligemma.language_model.forward(
                 inputs_embeds=inputs_embeds[0],
                 attention_mask=attention_mask,
@@ -155,7 +157,7 @@ class PaliGemmaWithExpertModel(nn.Module):
                 self._debug_gc_printed = True
 
             # Define the complete layer computation function for gradient checkpointing
-            def compute_layer_complete(layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond):
+            def compute_layer_complete(layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, kv_cache=None):
                 models = [self.paligemma.language_model, self.gemma_expert.model]
 
                 query_states = []
@@ -163,6 +165,8 @@ class PaliGemmaWithExpertModel(nn.Module):
                 value_states = []
                 gates = []
                 for i, hidden_states in enumerate(inputs_embeds):
+                    if hidden_states is None:
+                        continue
                     layer = models[i].layers[layer_idx]
                     hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
                     gates.append(gate)
@@ -193,7 +197,13 @@ class PaliGemmaWithExpertModel(nn.Module):
                 query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
                     query_states, key_states, cos, sin, unsqueeze_dim=1
                 )
-
+                if kv_cache is not None:
+                    if len(kv_cache) == 3:
+                        cache_k, cache_v, _ = kv_cache
+                    else:
+                        cache_k, cache_v = kv_cache
+                    key_states = torch.cat([cache_k, key_states], dim=2)
+                    value_states = torch.cat([cache_v, value_states], dim=2)
                 batch_size = query_states.shape[0]
                 scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
 
@@ -214,47 +224,166 @@ class PaliGemmaWithExpertModel(nn.Module):
                 outputs_embeds = []
                 start_pos = 0
                 for i, hidden_states in enumerate(inputs_embeds):
+                    if hidden_states is not None:
+                        layer = models[i].layers[layer_idx]
+                        end_pos = start_pos + hidden_states.shape[1]
+
+                        if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
+                            att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+                        out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
+
+                        # first residual
+                        out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
+                        after_first_residual = out_emb.clone()
+                        out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
+                        # Convert to bfloat16 if the next layer (mlp) uses bfloat16
+                        if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
+                            out_emb = out_emb.to(dtype=torch.bfloat16)
+
+                        out_emb = layer.mlp(out_emb)
+                        # second residual
+                        out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
+                        outputs_embeds.append(out_emb)
+                        start_pos = end_pos
+                    else:
+                        outputs_embeds.append(None)
+
+                return outputs_embeds, (key_states, value_states) if kv_cache is None else None
+            
+            def compute_ki_layer_complete(
+                layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, kv_cache=None
+            ):
+                models = [self.paligemma.language_model, self.gemma_expert.model]
+                
+                query_states = []
+                key_states = []
+                value_states = []
+                gates = []
+                q_masks = []
+                k_masks = []
+                for i, hidden_states in enumerate(inputs_embeds):
+                    if hidden_states is None:
+                        continue
                     layer = models[i].layers[layer_idx]
-                    end_pos = start_pos + hidden_states.shape[1]
+                    hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])
+                    gates.append(gate)
 
-                    if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
-                        att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
-                    out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
+                    input_shape = hidden_states.shape[:-1]
+                    B,T = input_shape
+                    device = hidden_states.device
+                    hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+                    query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                    key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                    value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                    
+                    q_mask = (
+                        torch.zeros((B,T),device = device, dtype = bool) 
+                        if i == 0 
+                        else torch.ones((B,T),device = device, dtype = bool)
+                    )
+                    k_mask = (
+                        torch.zeros((B,T),device = device, dtype = bool) 
+                        if i == 1 
+                        else torch.ones((B,T),device = device, dtype = bool)
+                    )
+                    
+                    query_states.append(query_state)
+                    key_states.append(key_state)
+                    value_states.append(value_state)
+                    q_masks.append(q_mask)
+                    k_masks.append(k_mask)
 
-                    # first residual
-                    out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
-                    after_first_residual = out_emb.clone()
-                    out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
-                    # Convert to bfloat16 if the next layer (mlp) uses bfloat16
-                    if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
-                        out_emb = out_emb.to(dtype=torch.bfloat16)
+                # Concatenate and process attention
+                query_states = torch.cat(query_states, dim=2)
+                key_states = torch.cat(key_states, dim=2)
+                value_states = torch.cat(value_states, dim=2)
+                q_masks = torch.cat(q_masks, dim=1)
+                k_masks = torch.cat(k_masks, dim=1)
+                
+                dummy_tensor = torch.zeros(
+                    query_states.shape[0],
+                    query_states.shape[2],
+                    query_states.shape[-1],
+                    device=query_states.device,
+                    dtype=query_states.dtype,
+                )
+                cos, sin = self.paligemma.model.language_model.rotary_emb(dummy_tensor, position_ids)
+                query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
+                    query_states, key_states, cos, sin, unsqueeze_dim=1
+                )
+                if kv_cache is not None:
+                    cache_k, cache_v, cache_k_mask = kv_cache
+                    key_states = torch.cat([cache_k, key_states], dim=2)
+                    value_states = torch.cat([cache_v, value_states], dim=2)
+                    k_masks = torch.cat([cache_k_mask, k_masks], dim=1)
 
-                    out_emb = layer.mlp(out_emb)
-                    # second residual
-                    out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
-                    outputs_embeds.append(out_emb)
-                    start_pos = end_pos
+                batch_size = query_states.shape[0]
+                scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
 
-                return outputs_embeds
+                # Attention computation
+                att_output, _ = modeling_gemma.eager_ki_attention_forward(
+                    self.paligemma.language_model.layers[layer_idx].self_attn,
+                    query_states,
+                    key_states,
+                    q_masks,
+                    k_masks,
+                    value_states,
+                    attention_mask,
+                    scaling,
+                )
+                head_dim = self.paligemma.language_model.layers[layer_idx].self_attn.head_dim
+                att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
+                
+                outputs_embeds = []
+                start_pos = 0
+                for i, hidden_states in enumerate(inputs_embeds):
+                    if hidden_states is not None:
+                        layer = models[i].layers[layer_idx]
+                        end_pos = start_pos + hidden_states.shape[1]
+
+                        if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
+                            att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+                        out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
+                        
+                        out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
+                        after_first_residual = out_emb.clone()
+                        out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
+                        if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
+                            out_emb = out_emb.to(dtype=torch.bfloat16)
+
+                        out_emb = layer.mlp(out_emb)
+                        out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
+                        outputs_embeds.append(out_emb)
+                        start_pos = end_pos
+                    else:
+                        outputs_embeds.append(None)
+                return outputs_embeds, (
+                    key_states[:,:,:-T,:],
+                    value_states[:,:,-T:,:],
+                    k_masks[:,:-T]
+                ) if kv_cache is None else None
+            compute_layer_fn = compute_ki_layer_complete if ki else compute_layer_complete
+            prefix_past_key_values = []
 
             # Process all layers with gradient checkpointing if enabled
             for layer_idx in range(num_layers):
                 if use_gradient_checkpointing:
-                    inputs_embeds = torch.utils.checkpoint.checkpoint(
-                        compute_layer_complete,
+                    inputs_embeds, kv_cache = torch.utils.checkpoint.checkpoint(
+                        compute_layer_fn,
                         layer_idx,
                         inputs_embeds,
                         attention_mask,
                         position_ids,
                         adarms_cond,
+                        past_key_values[layer_idx] if use_cache else None,
                         use_reentrant=False,
                         preserve_rng_state=False,
                     )
                 else:
-                    inputs_embeds = compute_layer_complete(
-                        layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond
+                    inputs_embeds, kv_cache = compute_layer_fn(
+                        layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, past_key_values[layer_idx] if use_cache else None
                     )
-
+                prefix_past_key_values.append(kv_cache)
                 # Old code removed - now using compute_layer_complete function above
 
             # final norm
@@ -262,9 +391,13 @@ class PaliGemmaWithExpertModel(nn.Module):
             def compute_final_norms(inputs_embeds, adarms_cond):
                 outputs_embeds = []
                 for i, hidden_states in enumerate(inputs_embeds):
-                    out_emb, _ = models[i].norm(hidden_states, cond=adarms_cond[i])
-                    outputs_embeds.append(out_emb)
+                    if hidden_states is not None:
+                        out_emb, _ = models[i].norm(hidden_states, cond=adarms_cond[i])
+                        outputs_embeds.append(out_emb)
+                    else:
+                        outputs_embeds.append(None)
                 return outputs_embeds
+                    
 
             # Apply gradient checkpointing to final norm if enabled
             if use_gradient_checkpointing:

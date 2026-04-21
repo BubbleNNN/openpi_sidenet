@@ -81,6 +81,11 @@ def select_observation_modalities(
     return observation.replace(modalities=selected_modalities)
 
 
+def move_observation_to_device(observation: _model.Observation, device: torch.device) -> _model.Observation:
+    """Move tensor leaves to device while leaving optional `None` fields untouched."""
+    return jax.tree.map(lambda x: x.to(device) if hasattr(x, "to") else x, observation)
+
+
 def init_logging():
     level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
 
@@ -208,12 +213,46 @@ def unwrap_model(model):
     return model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
 
 
+def resolve_sidenet_modalities(model, config: _config.TrainConfig) -> tuple[str, ...]:
+    """Resolve the modality set that will be forwarded into SideNet."""
+    available_branches = tuple(unwrap_model(model).sidenet.branches.keys())
+    requested_modalities = tuple(config.sidenet.modalities) or available_branches
+
+    unknown_modalities = sorted(set(requested_modalities) - set(available_branches))
+    if unknown_modalities:
+        raise ValueError(
+            "Configured SideNet modalities do not match the current SideNet YAML branches. "
+            f"Unknown: {unknown_modalities}; available: {sorted(available_branches)}"
+        )
+
+    return requested_modalities
+
+
 # FIX: allow SideNet training to optionally use a dedicated checkpoint root.
 def get_training_checkpoint_dir(config: _config.TrainConfig) -> pathlib.Path:
     override_dir = config.sidenet.checkpoint.sidenet_checkpoint_dir
     if override_dir:
         return pathlib.Path(override_dir).expanduser().resolve()
     return config.checkpoint_dir
+
+
+def get_checkpoint_asset_dir(
+    ckpt_dir: pathlib.Path,
+    asset_id: str | None,
+) -> pathlib.Path | None:
+    """Return a safe relative asset directory inside a split SideNet checkpoint."""
+    if asset_id is None:
+        return None
+
+    asset_path = pathlib.PurePosixPath(asset_id)
+    if asset_path.is_absolute() or any(part == ".." for part in asset_path.parts):
+        logging.warning(
+            "Skipping norm-stats checkpoint save because asset_id is not a safe relative path: %s",
+            asset_id,
+        )
+        return None
+
+    return ckpt_dir / "assets" / pathlib.Path(*asset_path.parts)
 
 
 # FIX: configure which parts of the wrapper are trainable before optimizer creation.
@@ -239,16 +278,13 @@ def configure_trainable_parameters(model, config: _config.TrainConfig) -> None:
         for param in branch.parameters():
             param.requires_grad_(branch_is_trainable)
 
-    # Gates are treated as shared parameters and always remain trainable.
-    for gate in unwrapped_model.sidenet.modality_gates.parameters():
-        gate.requires_grad_(True)
-
     # Shared SideNet components remain trainable.
-    for param in unwrapped_model.sidenet.fusion.parameters():
+    for param in unwrapped_model.sidenet.concat_self_attn.parameters():
         param.requires_grad_(True)
-    for param in unwrapped_model.sidenet.injectors.parameters():
+    for param in unwrapped_model.sidenet.text_conditioned_crossattn.parameters():
         param.requires_grad_(True)
-    unwrapped_model.sidenet.fusion_vectors.requires_grad_(True)
+    for param in unwrapped_model.sidenet.output_mlp.parameters():
+        param.requires_grad_(True)
 
 
 def save_base_pi05_checkpoint(model, ckpt_dir: pathlib.Path) -> None:
@@ -275,10 +311,9 @@ def _shared_sidenet_state_dict(model) -> dict[str, torch.Tensor]:
     shared_state: dict[str, torch.Tensor] = {}
     for key, value in model.sidenet.state_dict().items():
         if (
-            key == "fusion_vectors"
-            or key.startswith("fusion.")
-            or key.startswith("injectors.")
-            or key.startswith("modality_gates.")
+            key.startswith("concat_self_attn.")
+            or key.startswith("text_conditioned_crossattn.")
+            or key.startswith("output_mlp.")
         ):
             shared_state[key] = value.detach().cpu()
     return shared_state
@@ -292,19 +327,15 @@ def save_shared_parts_checkpoint(model, ckpt_dir: pathlib.Path) -> None:
 
 
 def _module_label_from_key(key: str) -> str:
-    if key == "fusion_vectors":
-        return "fusion_vectors"
-    if key.startswith("fusion."):
-        return "fusion"
-    if key.startswith("injectors."):
-        parts = key.split(".")
-        return ".".join(parts[:2]) if len(parts) >= 2 else "injectors"
     if key.startswith("branches."):
         parts = key.split(".")
         return ".".join(parts[:2]) if len(parts) >= 2 else "branches"
-    if key.startswith("modality_gates."):
-        parts = key.split(".")
-        return ".".join(parts[:2]) if len(parts) >= 2 else "modality_gates"
+    if key.startswith("concat_self_attn."):
+        return "concat_self_attn"
+    if key.startswith("text_conditioned_crossattn."):
+        return "text_conditioned_crossattn"
+    if key.startswith("output_mlp."):
+        return "output_mlp"
     return key.split(".")[0]
 
 
@@ -477,10 +508,14 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config,
         }
         torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
 
-        # save norm stats
+        # Save normalization stats inside the split checkpoint when the config
+        # uses a safe relative asset id. This keeps inference-side loading on
+        # the checkpoint-local `assets/<asset_id>` path consistent with the
+        # standard training checkpoints.
         norm_stats = data_config.norm_stats
-        if norm_stats is not None and data_config.asset_id is not None:
-            _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, norm_stats)
+        asset_dir = get_checkpoint_asset_dir(tmp_ckpt_dir, data_config.asset_id)
+        if norm_stats is not None and asset_dir is not None:
+            _normalize.save(asset_dir, norm_stats)
 
         # Atomically move temp directory to final location
         if final_ckpt_dir.exists():
@@ -747,6 +782,8 @@ def train_loop(config: _config.TrainConfig):
         pi05_weights_path=os.path.join(config.pytorch_weight_path, "model.safetensors"),
     ).to(device)
 
+    requested_modalities = resolve_sidenet_modalities(model, config)
+
     # FIX: optionally initialize SideNet from its own checkpoints before DDP wrapping.
     if not resuming:
         initialize_sidenet_from_config(model, config, device)
@@ -844,13 +881,12 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Training precision: {config.pytorch_training_precision}")
         # FIX: log SideNet-specific training knobs for experiment traceability.
         logging.info(
-            "SideNet config: path=%s train_pi05=%s modalities=%s trainable_branches=%s backbone_injector=%s expert_injector=%s",
+            "SideNet config: path=%s train_pi05=%s modalities=%s trainable_branches=%s loss_action_dim=%s",
             sidenet_config_path,
             config.sidenet.train_pi05,
-            tuple(config.sidenet.modalities),
+            requested_modalities,
             tuple(config.sidenet.trainable_branches),
-            config.sidenet.use_backbone_injector,
-            config.sidenet.use_expert_injector,
+            config.sidenet.loss_action_dim,
         )
         logging.info(
             "SideNet checkpoint config: save_base_pi05=%s save_sidenet_full=%s save_sidenet_branches=%s "
@@ -891,9 +927,9 @@ def train_loop(config: _config.TrainConfig):
             # directly into the wrapper model.
             observation = select_observation_modalities(
                 observation,
-                modalities=tuple(config.sidenet.modalities),
+                modalities=requested_modalities,
             )
-            observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
+            observation = move_observation_to_device(observation, device)  # noqa: PLW2901
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
 
@@ -909,8 +945,7 @@ def train_loop(config: _config.TrainConfig):
                 observation,
                 actions,
                 train_pi05=config.sidenet.train_pi05,
-                use_backbone_injector=config.sidenet.use_backbone_injector,
-                use_expert_injector=config.sidenet.use_expert_injector,
+                loss_action_dim=config.sidenet.loss_action_dim,
             )
             # Ensure losses is a tensor and handle different return types
             if isinstance(losses, list | tuple):

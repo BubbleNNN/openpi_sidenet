@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
+import json
 import torch
 
 import openpi.models.model as _model
@@ -137,6 +138,7 @@ def create_torch_dataset(
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
+    
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset = lerobot_dataset.LeRobotDataset(
@@ -399,6 +401,7 @@ class TorchDataLoader:
         sharding: jax.sharding.Sharding | None = None,
         shuffle: bool = False,
         sampler: torch.utils.data.Sampler | None = None,
+        drop_last: bool = True,
         num_batches: int | None = None,
         num_workers: int = 0,
         seed: int = 0,
@@ -433,6 +436,7 @@ class TorchDataLoader:
                 jax.sharding.Mesh(jax.devices(), ("B",)),
                 jax.sharding.PartitionSpec("B"),
             )
+        self._sampler = sampler
         self._num_batches = num_batches
 
         mp_context = None
@@ -451,7 +455,7 @@ class TorchDataLoader:
             persistent_workers=num_workers > 0,
             collate_fn=_collate_fn,
             worker_init_fn=_worker_init_fn,
-            drop_last=True,
+            drop_last=drop_last,
             generator=generator,
         )
 
@@ -476,6 +480,15 @@ class TorchDataLoader:
                     yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
                 else:
                     yield jax.tree.map(torch.as_tensor, batch)
+
+    def __len__(self) -> int:
+        if self._num_batches is not None:
+            return self._num_batches
+        return len(self._data_loader)
+
+    def set_epoch(self, epoch: int) -> None:
+        if hasattr(self._sampler, "set_epoch"):
+            self._sampler.set_epoch(epoch)
 
 
 def _collate_fn(items):
@@ -548,3 +561,10 @@ class DataLoaderImpl(DataLoader):
     def __iter__(self):
         for batch in self._data_loader:
             yield _model.Observation.from_dict(batch), batch["actions"]
+
+    def __len__(self) -> int:
+        return len(self._data_loader)
+
+    def set_epoch(self, epoch: int) -> None:
+        if hasattr(self._data_loader, "set_epoch"):
+            self._data_loader.set_epoch(epoch)
