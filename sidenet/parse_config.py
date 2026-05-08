@@ -1,10 +1,11 @@
 """
 Parse the SideNet v2 YAML config into typed Python objects.
 
-The v2 config is flat and describes the perceiver-based architecture:
-    d_model, num_perceiver_queries, num_perceiver_layers, num_input_tokens,
-    num_fusion_queries, num_heads, text_embed_dim, branches
-    (each with input_dim), output_mlp.
+The v2 config is flat and describes the physics-tokenizer + perceiver
+architecture:
+    d_embedding, d_sidenet, num_encoding_tokens, num_perceiver_layers,
+    num_injection_tokens, num_heads, vlm_hidden_dim, branches (each with
+    input_dim), output_mlp.
 """
 
 from __future__ import annotations
@@ -24,15 +25,15 @@ class BranchConfig:
 @dataclass
 class SideNetConfig:
     """Top-level SideNet v2 configuration."""
-    d_model: int
-    num_perceiver_queries: int
+    d_embedding: int
+    d_sidenet: int
+    num_encoding_tokens: int
     num_perceiver_layers: int
-    num_input_tokens: int
-    num_fusion_queries: int
+    num_injection_tokens: int
     num_heads: int
-    text_embed_dim: int
+    vlm_hidden_dim: int
     output_hidden_features: int
-    output_dim: int
+    action_expert_hidden_dim: int
     branches: dict[str, BranchConfig] = field(default_factory=dict)
 
 
@@ -44,8 +45,17 @@ def load_sidenet_config(config_path: str) -> SideNetConfig:
     if not isinstance(raw, dict):
         raise ValueError("Top-level config must be a dictionary")
 
-    required_keys = ["d_model", "num_perceiver_queries", "num_fusion_queries",
-                     "num_heads", "text_embed_dim", "branches", "output_mlp"]
+    required_keys = [
+        "d_embedding",
+        "d_sidenet",
+        "num_encoding_tokens",
+        "num_perceiver_layers",
+        "num_injection_tokens",
+        "num_heads",
+        "vlm_hidden_dim",
+        "branches",
+        "output_mlp",
+    ]
     for key in required_keys:
         if key not in raw:
             raise ValueError(f"Missing required top-level key: `{key}`")
@@ -72,14 +82,14 @@ def load_sidenet_config(config_path: str) -> SideNetConfig:
             raise ValueError(f"`output_mlp` must contain `{k}`")
 
     return SideNetConfig(
-        d_model=int(raw["d_model"]),
-        num_perceiver_queries=int(raw["num_perceiver_queries"]),
-        num_perceiver_layers=int(raw.get("num_perceiver_layers", 2)),
-        num_input_tokens=int(raw.get("num_input_tokens", 4)),
-        num_fusion_queries=int(raw["num_fusion_queries"]),
+        d_embedding=int(raw["d_embedding"]),
+        d_sidenet=int(raw["d_sidenet"]),
+        num_encoding_tokens=int(raw["num_encoding_tokens"]),
+        num_perceiver_layers=int(raw["num_perceiver_layers"]),
+        num_injection_tokens=int(raw["num_injection_tokens"]),
         num_heads=int(raw["num_heads"]),
-        text_embed_dim=int(raw["text_embed_dim"]),
+        vlm_hidden_dim=int(raw["vlm_hidden_dim"]),
         output_hidden_features=int(raw_mlp["hidden_features"]),
-        output_dim=int(raw_mlp["out_features"]),
+        action_expert_hidden_dim=int(raw_mlp["out_features"]),
         branches=branches,
     )

@@ -1,6 +1,6 @@
 """Standalone JAX PI0.5 + SideNet wrapper.
 
-This keeps the SideNet integration local to ``sidenet/jax`` by composing the
+This keeps the SideNet integration local to ``sidenet/jax_impl`` by composing the
 base JAX ``Pi0`` model instead of modifying ``src/openpi/models/pi0.py``.
 
 Current scope:
@@ -26,8 +26,8 @@ from openpi.models import pi0 as _pi0
 from openpi.models import pi0_config
 from openpi.shared import array_typing as at
 
-from sidenet.jax.sidenet import SideNet
-from sidenet.jax import weight_loader as sidenet_weight_loader
+from sidenet.jax_impl.sidenet import SideNet
+from sidenet.jax_impl import weight_loader as sidenet_weight_loader
 from sidenet.parse_config import load_sidenet_config
 
 
@@ -89,29 +89,29 @@ class Pi05WithSideNet(_model.BaseModel):
         self.sidenet = nnx_bridge.ToNNX(
             SideNet(
                 branch_input_dims=(("ft_sensor", config.ft_sensor_dim),),
-                d_model=sidenet_cfg.d_model,
-                num_perceiver_queries=sidenet_cfg.num_perceiver_queries,
-                num_input_tokens=sidenet_cfg.num_input_tokens,
+                d_embedding=sidenet_cfg.d_embedding,
+                d_sidenet=sidenet_cfg.d_sidenet,
+                num_encoding_tokens=sidenet_cfg.num_encoding_tokens,
                 num_perceiver_layers=sidenet_cfg.num_perceiver_layers,
-                num_fusion_queries=sidenet_cfg.num_fusion_queries,
+                num_injection_tokens=sidenet_cfg.num_injection_tokens,
                 num_heads=sidenet_cfg.num_heads,
-                text_embed_dim=sidenet_cfg.text_embed_dim,
+                vlm_hidden_dim=sidenet_cfg.vlm_hidden_dim,
                 output_hidden_features=sidenet_cfg.output_hidden_features,
-                output_dim=sidenet_cfg.output_dim,
+                action_expert_hidden_dim=sidenet_cfg.action_expert_hidden_dim,
             )
         )
 
         fake_modality_inputs = {
             "ft_sensor": jnp.ones((1, config.ft_sensor_dim), dtype=jnp.float32),
         }
-        fake_text_embeddings = jnp.ones(
-            (1, config.max_token_len, sidenet_cfg.text_embed_dim),
+        fake_text_hidden_states = jnp.ones(
+            (1, config.max_token_len, sidenet_cfg.vlm_hidden_dim),
             dtype=jnp.float32,
         )
         fake_text_mask = jnp.ones((1, config.max_token_len), dtype=jnp.bool_)
         self.sidenet.lazy_init(
             fake_modality_inputs,
-            fake_text_embeddings,
+            fake_text_hidden_states,
             fake_text_mask,
             deterministic=True,
             rngs=rngs,
@@ -181,12 +181,19 @@ class Pi05WithSideNet(_model.BaseModel):
         modality_inputs = {
             "ft_sensor": ft_sensor,
         }
-        return self.sidenet(
+        side_tokens = self.sidenet(
             modality_inputs,
             text_features,
             text_mask,
             deterministic=deterministic,
         )
+        if side_tokens.ndim == 4:
+            side_tokens = side_tokens.reshape(
+                side_tokens.shape[0],
+                side_tokens.shape[1] * side_tokens.shape[2],
+                side_tokens.shape[3],
+            )
+        return side_tokens
 
     @staticmethod
     def _prepend_side_tokens(

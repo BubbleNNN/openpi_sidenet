@@ -28,7 +28,7 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
-import sidenet.jax.checkpointing as sidenet_jax_checkpointing
+import sidenet.jax_impl.checkpointing as sidenet_jax_checkpointing
 try:
     from tensorboardX import SummaryWriter
     _TENSORBOARD_AVAILABLE = True

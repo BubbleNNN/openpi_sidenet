@@ -18,7 +18,7 @@ from openpi.models import model as _model
 from openpi.models import pi0 as _pi0
 
 try:
-    from sidenet.jax import pi05_with_sidenet as _pi05_with_sidenet
+    from sidenet.jax_impl import pi05_with_sidenet as _pi05_with_sidenet
 except Exception:  # pragma: no cover - checker should still work in clean openpi.
     _pi05_with_sidenet = None
 

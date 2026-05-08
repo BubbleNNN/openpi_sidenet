@@ -1,6 +1,6 @@
 # JAX SideNet
 
-This directory contains the JAX SideNet path that stays local to `sidenet/jax`.
+This directory contains the JAX SideNet path that stays local to `sidenet/jax_impl`.
 
 The key point is that the integration is done by a standalone wrapper model,
 not by modifying `src/openpi/models/pi0.py`.
@@ -11,7 +11,7 @@ not by modifying `src/openpi/models/pi0.py`.
   - `Pi05WithSideNetConfig`
   - `Pi05WithSideNet`
 
-This wrapper composes the existing JAX `Pi0/Pi0.5` model with `sidenet/jax/SideNet`
+This wrapper composes the existing JAX `Pi0/Pi0.5` model with `sidenet/jax_impl/SideNet`
 and injects SideNet output tokens into the suffix/action-expert path.
 
 ## Current behavior
@@ -44,7 +44,7 @@ the `ft_sensor` branch with `input_dim: 12`.
 ## Training
 
 Wrapper-friendly base checkpoint loading is implemented in
-`sidenet/jax/weight_loader.py`.
+`sidenet/jax_impl/weight_loader.py`.
 Unlike the generic OpenPI loader, it keeps any missing SideNet parameters at
 their initialized values instead of requiring the checkpoint to contain the
 full wrapper tree.

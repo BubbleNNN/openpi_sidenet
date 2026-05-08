@@ -248,6 +248,7 @@ class AbsoluteActions(DataTransformFn):
 class TokenizePrompt(DataTransformFn):
     tokenizer: _tokenizer.PaligemmaTokenizer
     discrete_state_input: bool = False
+    discrete_force_input: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.pop("prompt", None)) is None:
@@ -259,10 +260,16 @@ class TokenizePrompt(DataTransformFn):
         else:
             state = None
 
+        if self.discrete_force_input:
+            if (force := data.get("ft_sensor", None)) is None:
+                raise ValueError("Force/torque input is required.")
+        else:
+            force = None
+
         if not isinstance(prompt, str):
             prompt = prompt.item()
 
-        tokens, token_masks = self.tokenizer.tokenize(prompt, state)
+        tokens, token_masks = self.tokenizer.tokenize(prompt, state, force)
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
 
 
