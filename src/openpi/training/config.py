@@ -26,6 +26,7 @@ import openpi.policies.samsung_policy as samsung_policy
 import openpi.policies.rby1_policy as rby1_policy
 import policies.rby1_xhand_policy as rby1_xhand_policy
 import openpi.shared.download as _download
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
@@ -34,8 +35,9 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.checker as training_checker
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
-import sidenet.jax.pi05_with_sidenet as pi05_with_sidenet_jax
-import sidenet.jax.weight_loader as sidenet_jax_weight_loader
+import sidenet.jax_impl.pi05_with_sidenet as pi05_with_sidenet_jax
+import sidenet.jax_impl.pi05_with_sidenet_llama_adapter as pi05_with_sidenet_llama_adapter_jax
+import sidenet.jax_impl.weight_loader as sidenet_jax_weight_loader
 
 from openpi.policies.rby1_policy import RBY1_ACTION_DIM
 
@@ -1569,6 +1571,44 @@ _CONFIGS = [
             "gs://openpi-assets/checkpoints/pi05_base/params",
             log_prefix="pi05_with_sidenet_jax",
         ),
+        sidenet=SideNetTrainConfig(
+            enabled=False,
+            config_path="./sidenet/sidenet_config.yaml",
+            modalities=("ft_sensor",),
+        ),
+        num_train_steps=20_000,
+    ),
+    TrainConfig(
+        # SideNet split-softmax injection: the last action-expert blocks are
+        # injection-aware, while earlier layers stay structurally base Gemma.
+        # First-step loss matches base pi0.5 via zero-init per-head gates.
+        name="pi05_with_sidenet_llama_adapter_jax",
+        model=pi05_with_sidenet_llama_adapter_jax.Pi05WithSideNetAdapterConfig(
+            pi05=True,
+            use_force=False,
+            action_dim=32,
+            action_horizon=30,
+            sidenet_config_path="./sidenet/sidenet_config.yaml",
+            num_injected_layers=1,
+        ),
+        data=LeRobotRby1FTDataConfig(
+            default_prompt="Insert the right water hose into the hole",
+            exclude_torso=True,
+        ),
+        weight_loader=sidenet_jax_weight_loader.AdapterCheckpointWeightLoader(
+            params_path="gs://openpi-assets/checkpoints/pi05_base/params",
+            num_injected_layers=1,
+            log_prefix="pi05_with_sidenet_llama_adapter_jax",
+        ),
+        # Freeze backbone except V2-style normalization params; also train
+        # SideNet and per-head injection gates.
+        # Trainable: sidenet/*, injection_gate, *norm*.
+        freeze_filter=nnx.All(
+            nnx.Not(nnx_utils.PathRegex(".*sidenet.*")),
+            nnx.Not(nnx_utils.PathRegex(".*injection_gate.*")),
+            nnx.Not(nnx_utils.PathRegex(".*norm.*")),
+        ),
+        ema_decay=None,
         sidenet=SideNetTrainConfig(
             enabled=False,
             config_path="./sidenet/sidenet_config.yaml",
