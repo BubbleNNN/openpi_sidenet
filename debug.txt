@@ -1,57 +1,156 @@
-import dataclasses
-import logging
-import socket
+下面详述整个推理流程的数据流：
 
-import tyro
+### VLM BackBone Output
 
-from openpi.policies import policy as _policy
-from openpi.policies import policy_config as _policy_config
-from openpi.serving import websocket_policy_server
-from openpi.training import config as _config
+输出prefix tokens，形状为 $(B,L,d_{vlm})$
 
+### Text Tokens
 
-@dataclasses.dataclass
-class Args:
-    # Training config name.
-    config: str = "pi05_with_sidenet"
-    # Checkpoint directory, e.g. /path/to/checkpoints/pi05_with_sidenet/train/20000
-    dir: str = tyro.MISSING
-    # Default prompt when the request does not contain one.
-    default_prompt: str | None = None
-    # Port to serve on.
-    port: int = 8000
-    # Record requests and responses for debugging.
-    record: bool = False
-    # Optional explicit PyTorch device, e.g. cuda:0
-    pytorch_device: str | None = None
+从prefix tokens中获取text hidden states： 
 
+$$
+\textbf{TextHiddenStates}=\textbf{prefix}[:,-L_{text},:]
+$$
 
-def main(args: Args) -> None:
-    train_config = _config.get_config(args.config)
-    policy = _policy_config.create_trained_policy(
-        train_config,
-        args.dir,
-        default_prompt=args.default_prompt,
-        pytorch_device=args.pytorch_device,
-    )
-    policy_metadata = policy.metadata
+之后经过MLP projector 投影得到text feature tokens：
 
-    if args.record:
-        policy = _policy.PolicyRecorder(policy, "policy_records")
+$$
+\textbf{TextTokens}=MLP(LN(\textbf{TextHiddenStates}))
+$$
 
-    hostname = socket.gethostname()
-    local_ip = socket.gethostbyname(hostname)
-    logging.info("Creating RBY1 server (host: %s, ip: %s)", hostname, local_ip)
+形状为 $(B,L_{text},d_{sidenet})$
 
-    server = websocket_policy_server.WebsocketPolicyServer(
-        policy=policy,
-        host="0.0.0.0",
-        port=args.port,
-        metadata=policy_metadata,
-    )
-    server.serve_forever()
+### Cross Attention Queries
 
+创建learnable queries，形状为 $(N_{layers},L_{injection},d_{sidenet})$
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, force=True)
-    main(tyro.cli(Args))
+其中， $N_{layers}$是被注入的action expert层数， $L_{injection}$是每个注入向量的长度， $d_{sidenet}$是sidenet hidden dim
+
+把learnable query作为Q，Text Tokens作为KV，进行cross attention，获得用任务语义增强的cros attention queries：
+
+$$
+\textbf{CrossAttnQueries}=\textbf{learnableQuery}+crossAttn(LN(\textbf{learnableQuery}),LN(\textbf{TextTokens}),LN(\textbf{TextTokens}),attnMask)
+$$
+
+由于text tokens里面有padding的部分，所以需要attn mask防止引入多余信息。
+
+### Physics Tokenizer
+
+由于大部分模态信号（例如ft sensor）输入格式不固定且有明确的物理含义，需要一个tokenizer将他们统一成物理含义明确、维度固定的tokens，方便下游的Perceiver Encoder处理
+
+对于每一种输入模态，在暂时不考虑历史窗口的情况下，其形状 $(B,L_{modality})$
+
+将该模态信号重新拼接为 $(B,L_{phyTokens},d_{token})$
+
+其中， $L_{phyTokens}$是从输入模态信号切分出来的“物理单元”的数目，根据输入模态的不同而不同。例如，在ft sensor信号中，输入信号12dim，其结构为：
+
+- 0-2dim：右臂受力
+- 3-5dim：右臂力矩
+- 6-8dim：左臂受力
+- 9-11dim：左臂力矩
+
+这样，ft sensor就被很自然地切分成4个物理单元，每个物理单元的长度为3，也就是该模态信号会被reshape为 (B,4,3)
+
+之后，对每个物理单元进行normalization操作，并且使用MLP将他们投影至合适的维度 $d_{embedding}$
+
+最后，对每个PhyTokens叠加可学习的physical embedding，标识某个位置代表的物理含义；如果是双臂机器人，可以加入arm embedding，标识数据来源。
+
+$$
+\textbf{PhyTokens}=MLP(reshape(input),d_{token},d_{embedding})+E_{physical}
+$$
+
+最终得到PhyTokens的形状： $(B,L_{PhyTokens},d_{embedding})$
+
+### Perceiver Encoder
+
+接受来自Physics Tokenizer的输出PhyTokens
+
+对于每个modality branch，设置一个learnable query Q，形状为 $(L_{encoding},d_{embedding})$
+
+其中， $L_{encoding}$是每个模态信号经过处理之后共同的输出长度。这样处理消除了后续由于长度不一带来的模态偏好。
+
+遵循OpenFlamingo的方案:
+
+$$
+Z = Q+crossAttn(LN(Q),LN(\textbf{PhyTokens}),\textbf{PhyTokens}) \newline Z = Z+selfAttn(LN(Z))\newline
+Z = Z+FFN(LN(Z)) \newline Z = Z + E_{modality}
+$$
+
+其中最后一个embedding是针对模态特定的embedding
+
+最终输出：不同模态长度一致，维度一致的modality tokens，形状为 $(B,L_{encoding},d_{sidenet})$
+
+### Concatenate
+
+将来自不同模态的modality tokens拼接在一起，得到MMTokens：
+
+$$
+MMTokens=concat(modality tokens),shape(B,m*L_{encoding},d_{embedding})
+$$
+
+### CrossAttn
+
+取之前得到的CrossAttnQuries(Q)和MMTokens(MMT)，直接进行cross attn：
+
+$$
+O = Q+xAttn(LN(Q),LN(MMT),MMT)\newline
+O = O+FFN(LN(O),d_{sidenet},d_{sidenet}) \newline
+\text{MMFusedFeature}=FFN(O,d_{sidenet},d_{actionExpert})
+$$
+
+最终获得的MMFusedFeature形状为： 
+
+$$
+(B,N_{layers},L_{injection},d_{actionExpert})
+$$
+
+其中， $d_{actionExpert}$是action expert的hidden dim
+
+### Injection
+
+对于action expert里面的一个注入目标层，取出其对应的MMFusedFeature,形状为 $(B,L_{injection},d_{actionExpert})$，记为M
+
+记其原始输入为P，则注入过程如下：
+
+首先构造 
+
+$$
+Q=W_QP,K=W_k[M,P],V=W_{v}[M,P]
+$$
+
+之后计算attn score 
+
+$$
+attnScore = \frac{QK^T}{\sqrt{d_k}}
+$$
+
+形状 $(B,L_P,L_M+L_P)$
+
+记沿着最后一个维度前  $L_M$个元素组成的向量为 $S_M$,后 $L_P$个元素组成的向量为 $S_P$
+
+则后续计算为:
+
+$$
+O=W_O([softmax(S_M)*tanh(g),softmax(S_P)]V)
+$$
+
+其中g是head-wise的门控,原有的attention mask依然保留并且在Sp相关分支中使用。注意这里是split softmax
+
+之后没有其他修改。
+
+Note：
+
+1. side tokens 的 RoPE position 设为 0。
+    
+    也就是 injection tokens 不获得正常时间/序列位置，避免污染原始 action token 的位置结构。
+    
+2. KV cache 不保存 side tokens。
+    
+    side tokens 只在当前 injected layer 当前 forward 里作为额外 K/V memory，不进入后续 cache。
+    
+
+### 主干模型冻结情况
+
+按照LlamaAdapterV2的做法，解冻所有normalization layer，冻结其他所有参数。
+
+后续可以给每个mlp layer加入scaler和bias
